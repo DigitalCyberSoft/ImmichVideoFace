@@ -169,6 +169,17 @@ ivf status         # progress, and whether staged runs are still valid
 beside the person matched, colour-coded by confidence, each video linked directly to its asset
 in Immich. Numbered new-person candidates appear at the bottom.
 
+The header states the run number and exactly what would be written, and nothing has been:
+
+![Report header showing run totals and the commit command](docs/report-header.png)
+
+Each asset lists its clusters, the person matched, the distance and the margin over the
+runner-up, so a borderline call is visible rather than buried:
+
+![Matched clusters with face crops, distances and margins](docs/report-matches.png)
+
+*Faces, names and asset identifiers in these screenshots are redacted.*
+
 The report is a sense check, not an editor. If something looks wrong, adjust thresholds and
 re-scan rather than hand-editing.
 
@@ -189,6 +200,10 @@ worth naming.
 
 Each candidate is shown with the **closest known person**, because a group that missed the
 matching threshold is usually somebody already in your library rather than a stranger:
+
+![New-people candidates with the closest known person and a ready-made promote command](docs/report-new-people.png)
+
+The same listing in the terminal:
 
 ```
  # │ Videos │ Appearances │ Closest known person │ Distance

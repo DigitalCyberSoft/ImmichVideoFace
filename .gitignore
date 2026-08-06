@@ -18,3 +18,6 @@ build/
 # Models downloaded at first run
 .models/
 .insightface/
+
+# Unredacted source screenshots
+Screenshot_*.png
