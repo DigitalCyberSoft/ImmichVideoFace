@@ -1,0 +1,64 @@
+# Copy to config.toml and fill in. config.toml is gitignored.
+# Secrets are better supplied as env vars: IMMICH_API_KEY, IMMICH_DB_PASSWORD.
+
+[immich]
+url = "http://localhost:2283"
+public_url = ""       # address for report links; blank = same as url
+api_key = ""          # prefer $IMMICH_API_KEY
+owner_id = ""         # blank = resolved from the API key's user
+
+[paths]
+# Immich stores container-absolute paths; map them to where you can read them.
+data_root_container = "/data"
+data_root_host = "/var/lib/immich/library"
+
+[db]
+host = "docker:immich_postgres"   # resolves the bridge IP; 5432 is not published
+port = 5432
+name = "immich"
+user = "postgres"
+password = ""         # prefer $IMMICH_DB_PASSWORD
+
+[select]
+# A Live Photo's motion clip is a hidden asset, so a face written there is never
+# displayed. These can be ~half a library.
+#   redirect - scan the clip, write faces onto the paired still (recommended)
+#   skip     - ignore them entirely
+#   scan     - write onto the hidden clip itself (almost always pointless)
+live_photos = "redirect"
+
+[sampling]
+keyframes = true
+min_fps = 8.0         # 1.0 loses people who are only on screen a few seconds
+max_long_edge = 960
+max_frames = 3000
+
+[detect]
+# MUST match Immich's own model (Administration -> Settings -> Machine Learning
+# -> Facial Recognition). A different model means a different vector space and
+# every match becomes nonsense. `ivf check` compares the two and `ivf scan`
+# refuses to run on a mismatch.
+model = "buffalo_l"
+min_score = 0.7       # Immich's minScore
+device = "cuda"
+det_size = 640
+batch_size = 16
+min_face_px = 40      # below this ArcFace is upscaling guesswork
+
+[cluster]
+distance = 0.55       # same face across a video easily exceeds 0.4; see README
+min_observations = 3  # kills single-frame false positives
+
+[match]
+max_distance = 0.4    # stricter than Immich's 0.5; video frames are blurrier
+top_k = 5
+named_people_only = false   # unnamed clusters are still valid match targets
+min_margin = 0.05     # required lead over the runner-up person
+probe_observations = 5      # also score the sharpest frames, not just the centroid
+prefer_named_within = 0.06  # break unnamed-vs-named ties towards the name
+
+[writeback]
+enabled = true
+bank_unmatched = true       # local only; people are created by `ivf promote <numbers>`
+promote_min_assets = 3      # videos a face must recur across to be offered
+tag = "VideoFaceScan/scanned"

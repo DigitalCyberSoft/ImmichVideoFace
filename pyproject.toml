@@ -1,0 +1,59 @@
+[project]
+name = "immich-video-face"
+version = "0.1.0"
+description = "Scan the full duration of Immich videos for faces, not just the thumbnail"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+keywords = ["immich", "face-recognition", "video", "insightface", "photos"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "httpx>=0.27",
+    "psycopg[binary,pool]>=3.2",
+    "numpy>=2.0",
+    "pydantic>=2.7",
+    "typer>=0.12",
+    "rich>=13.7",
+    "insightface>=0.7.3",
+    "onnxruntime-gpu>=1.20",
+    "opencv-python-headless>=4.10",
+    "scikit-learn>=1.5",
+]
+
+[project.optional-dependencies]
+# onnxruntime-gpu 1.28 links against CUDA 13; these ship the runtime libraries
+# so the host needs no system CUDA install.
+# NVIDIA dropped the -cuXX suffix for the CUDA 13 series; the -cu13 names are
+# deprecated stubs that fail to build. cuDNN still carries the suffix.
+cuda = [
+    "nvidia-cuda-runtime>=13",
+    "nvidia-cublas>=13",
+    "nvidia-curand>=10.4",
+    "nvidia-cudnn-cu13>=9",
+]
+
+[project.urls]
+Homepage = "https://github.com/CarlitoGrey/ImmichVideoFace"
+Issues = "https://github.com/CarlitoGrey/ImmichVideoFace/issues"
+
+[project.scripts]
+ivf = "immich_video_face.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/immich_video_face"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

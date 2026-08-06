@@ -1,0 +1,225 @@
+"""Configuration loading and the fingerprint that drives re-scan decisions."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import tomllib
+from functools import cached_property
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+DEFAULT_CONFIG_PATHS = (
+    Path("config.toml"),
+    Path.home() / ".config" / "immich-video-face" / "config.toml",
+)
+
+
+class ImmichSettings(BaseModel):
+    url: str = "http://localhost:2283"
+    api_key: str = ""
+    # Left blank, resolved from the API key's own user at startup.
+    owner_id: str = ""
+    timeout: float = 30.0
+    # Address for links in reports. `url` is usually localhost, which is right
+    # for the API but useless in a browser on another machine.
+    public_url: str = ""
+
+    @property
+    def browse_url(self) -> str:
+        return self.public_url or self.url
+
+
+class PathSettings(BaseModel):
+    """Immich stores container-absolute paths; we read the files from the host."""
+
+    data_root_container: str = "/data"
+    data_root_host: str = "/var/lib/immich/library"
+
+    def to_host(self, original_path: str) -> Path:
+        if original_path.startswith(self.data_root_container):
+            suffix = original_path[len(self.data_root_container) :].lstrip("/")
+            return Path(self.data_root_host) / suffix
+        return Path(original_path)
+
+
+class DbSettings(BaseModel):
+    # "docker:<container>" resolves the container's bridge IP at startup, since
+    # Immich does not publish 5432 to the host and the IP moves on restart.
+    host: str = "docker:immich_postgres"
+    port: int = 5432
+    name: str = "immich"
+    user: str = "postgres"
+    password: str = ""
+
+    def resolve_host(self) -> str:
+        if not self.host.startswith("docker:"):
+            return self.host
+        container = self.host.split(":", 1)[1]
+        result = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                container,
+                "--format",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Could not resolve container {container!r} via docker inspect: "
+                f"{result.stderr.strip()}. Set db.host to an explicit address instead."
+            )
+        ips = result.stdout.split()
+        if not ips:
+            raise RuntimeError(f"Container {container!r} has no network address.")
+        return ips[0]
+
+    def dsn(self) -> str:
+        return (
+            f"postgresql://{self.user}:{self.password}"
+            f"@{self.resolve_host()}:{self.port}/{self.name}"
+        )
+
+
+class SelectSettings(BaseModel):
+    """Which videos are worth scanning, and where their results belong."""
+
+    # A Live Photo's motion clip is a hidden asset: a face written there is never
+    # displayed, because the still image beside it is what Immich shows.
+    #
+    #   redirect - scan the clip, write faces onto the paired still (default).
+    #              Anyone already detected on the still is skipped as a duplicate,
+    #              so only people who appear *in the motion but not the still*
+    #              produce a write. That is the gap worth filling.
+    #   skip     - ignore these clips entirely.
+    #   scan     - write onto the hidden clip itself. Almost always pointless.
+    live_photos: Literal["redirect", "skip", "scan"] = "redirect"
+
+
+class SamplingSettings(BaseModel):
+    keyframes: bool = True
+    # Brief appearances are the ones that get lost: at 1 fps a three-second
+    # appearance yields three observations, which `min_observations` discards if
+    # clustering splits them at all. Decode dominates runtime rather than frame
+    # count, so raising this is cheaper than it looks.
+    min_fps: float = 8.0
+    max_long_edge: int = 960
+    # Safety valve for the handful of very long videos in the library.
+    max_frames: int = 3000
+
+
+class DetectSettings(BaseModel):
+    model: str = "buffalo_l"
+    min_score: float = 0.7
+    device: str = "cuda"
+    det_size: int = 640
+    batch_size: int = 16
+    # ArcFace aligns to 112x112, so a face detected much smaller than that is
+    # upscaled guesswork. Those embeddings are noisy enough to fragment
+    # clustering, and on real footage discarding them cost no matches while
+    # cutting cluster count by 2-4x.
+    min_face_px: int = 40
+
+
+class ClusterSettings(BaseModel):
+    # Cosine distance between two views of the *same* face across a video --
+    # different angles, motion blur and lighting -- routinely exceeds 0.4.
+    # At 0.35 appearances shattered into singletons which min_observations then
+    # discarded, losing people who were plainly visible. Immich's own
+    # recognition threshold is 0.5, so this sits deliberately near it.
+    distance: float = 0.55
+    min_observations: int = 3
+
+
+class MatchSettings(BaseModel):
+    max_distance: float = 0.4
+    top_k: int = 5
+    named_people_only: bool = False
+    # Minimum lead over the runner-up person. Observed on real data: correct
+    # matches lead by 0.27-0.34, while near-misses lead by under 0.02, so this
+    # separates them far more cleanly than absolute distance alone.
+    min_margin: float = 0.05
+    # Also score this many of the sharpest individual observations, not just
+    # the cluster centroid, and keep the best result. Averaging a whole
+    # appearance dilutes clean frontal frames with profile and blurred ones.
+    probe_observations: int = 5
+    # When the nearest person is an unnamed cluster and a *named* person is
+    # within this distance of it, prefer the name. Immich libraries commonly
+    # hold one person as both a name and stray unnamed clusters.
+    prefer_named_within: float = 0.06
+
+
+class WritebackSettings(BaseModel):
+    enabled: bool = True
+    # Record clusters that matched nobody. Purely local -- no person is created
+    # until `ivf promote --write`, which groups them across videos first.
+    bank_unmatched: bool = True
+    # A group must span this many distinct videos before it is offered as a new
+    # person. One stranger in one clip is noise; the same face across several
+    # is somebody worth naming.
+    promote_min_assets: int = 3
+    tag: str = "VideoFaceScan/scanned"
+
+
+class Config(BaseModel):
+    immich: ImmichSettings = Field(default_factory=ImmichSettings)
+    paths: PathSettings = Field(default_factory=PathSettings)
+    db: DbSettings = Field(default_factory=DbSettings)
+    select: SelectSettings = Field(default_factory=SelectSettings)
+    sampling: SamplingSettings = Field(default_factory=SamplingSettings)
+    detect: DetectSettings = Field(default_factory=DetectSettings)
+    cluster: ClusterSettings = Field(default_factory=ClusterSettings)
+    match: MatchSettings = Field(default_factory=MatchSettings)
+    writeback: WritebackSettings = Field(default_factory=WritebackSettings)
+
+    state_db: Path = Path("ivf-state.sqlite3")
+    report_dir: Path = Path("reports")
+
+    @cached_property
+    def fingerprint(self) -> str:
+        """Hash of everything that changes results.
+
+        Stored per asset so that tuning a threshold correctly invalidates prior
+        scans, while re-running with identical settings stays a no-op.
+        """
+        payload = {
+            # `select` belongs here because live_photos changes which *asset* a
+            # face is written to, not merely which videos are looked at. Leaving
+            # it out let runs staged under the old behaviour pass the staleness
+            # check while still pointing at hidden clips.
+            "select": self.select.model_dump(),
+            "sampling": self.sampling.model_dump(),
+            "detect": self.detect.model_dump(),
+            "cluster": self.cluster.model_dump(),
+            "match": self.match.model_dump(),
+        }
+        blob = json.dumps(payload, sort_keys=True).encode()
+        return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _apply_env(data: dict) -> dict:
+    """Environment overrides for the two values that should not live in a file."""
+    if key := os.environ.get("IMMICH_API_KEY"):
+        data.setdefault("immich", {})["api_key"] = key
+    if pw := os.environ.get("IMMICH_DB_PASSWORD"):
+        data.setdefault("db", {})["password"] = pw
+    return data
+
+
+def load_config(path: Path | None = None) -> Config:
+    candidates = [path] if path else list(DEFAULT_CONFIG_PATHS)
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            with candidate.open("rb") as handle:
+                return Config.model_validate(_apply_env(tomllib.load(handle)))
+    if path:
+        raise FileNotFoundError(f"Config file not found: {path}")
+    return Config.model_validate(_apply_env({}))
