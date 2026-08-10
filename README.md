@@ -15,16 +15,6 @@ No Immich fork, no patched container, nothing added to the Immich stack.
 > writes faces into your Immich database. Nothing here has been exercised on anyone else's
 > setup, Immich version, or data.
 >
-> Take a database backup before your first run, and keep it until you're satisfied:
->
-> ```bash
-> docker exec immich_postgres pg_dumpall -c -U postgres | gzip > immich-backup.sql.gz
-> ```
->
-> Note there is no `-t`. The commonly copied version of this command uses `docker exec -t`,
-> which allocates a TTY and rewrites every `\n` as `\r\n` — on one library that was ~3,900
-> stray carriage returns in the first 400 KB, enough to break the restore you were relying on.
->
 > Every write is designed to be reversible with `ivf undo`, and the tool never modifies your
 > media files or writes to the database directly. But "designed to be" is not the same as
 > "proven across every setup", and a backup costs you a minute. Please read
