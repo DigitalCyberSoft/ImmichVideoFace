@@ -66,3 +66,17 @@ def test_failed_assets_count_as_done_unless_retrying(tmp_path):
         assert state.already_scanned("fp", include_failed=False) == {"ok"}
         assert state.already_scanned("other") == set()
         assert state.failed_assets() == [("bad", "moov atom not found")]
+
+
+def test_rekey_moves_scans_and_runs(tmp_path):
+    from immich_video_face.state import State
+
+    with State(tmp_path / "state.sqlite3") as state:
+        run = state.start_run("old", "scan")
+        state.record_scan(asset_id="a", fingerprint="old", run_id=run, frames=1, observations=0,
+                          clusters=0, matches=0, status="ok", error=None)
+        state.settle_run(run)
+        assert state.rekey({"old", None, "new"}, "new") == 1
+        assert state.already_scanned("new") == {"a"}
+        assert state.run_fingerprint(run) == "new"
+        assert state.rekey(set(), "new") == 0

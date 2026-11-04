@@ -155,6 +155,59 @@ class VideoIndex:
                 (asset_id, int(round(duration_s * 1000)), frames, len(rows), fingerprint),
             )
 
+    def frame_models(self) -> set[str]:
+        """Search models that frames are currently embedded with."""
+        with self._conn.cursor() as cur:
+            cur.execute(sql.SQL("SELECT DISTINCT model FROM {}").format(self._t("frame_embedding")))
+            models = {row[0] for row in cur.fetchall()}
+        self._conn.rollback()
+        return models
+
+    def stale_videos(self, model: str) -> list[str]:
+        """Videos with frames embedded by a model other than `model`."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    "SELECT DISTINCT asset_id::text FROM {} WHERE model <> %s ORDER BY 1"
+                ).format(self._t("frame_embedding")),
+                (model,),
+            )
+            ids = [row[0] for row in cur.fetchall()]
+        self._conn.rollback()
+        return ids
+
+    def replace_frames(
+        self, *, asset_id: str, frame_embeddings: list[tuple[float, np.ndarray]], model: str
+    ) -> int:
+        """Replace one video's frame embeddings, leaving its scan record alone."""
+        rows = []
+        seen: set[int] = set()
+        for time_s, vector in frame_embeddings:
+            time_ms = int(round(time_s * 1000))
+            if time_ms not in seen:
+                seen.add(time_ms)
+                rows.append((asset_id, time_ms, model, _vector_literal(vector)))
+        with self._conn.transaction(), self._conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("DELETE FROM {} WHERE asset_id = %s").format(self._t("frame_embedding")),
+                (asset_id,),
+            )
+            if rows:
+                cur.executemany(
+                    sql.SQL(
+                        "INSERT INTO {} (asset_id, time_ms, model, embedding) "
+                        "VALUES (%s, %s, %s, %s::vector)"
+                    ).format(self._t("frame_embedding")),
+                    rows,
+                )
+            cur.execute(
+                sql.SQL("UPDATE {} SET clip_frames = %s, indexed_at = now() WHERE asset_id = %s").format(
+                    self._t("video")
+                ),
+                (len(rows), asset_id),
+            )
+        return len(rows)
+
     # ---- appearances ----------------------------------------------------
 
     def upsert_appearance(

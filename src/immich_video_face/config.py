@@ -293,7 +293,18 @@ class Config(BaseModel):
         Stored per asset so that tuning a threshold correctly invalidates prior
         scans, while re-running with identical settings stays a no-op.
         """
-        payload = {
+        payload = self._payload()
+        # Only when switched on, so turning nothing on leaves existing
+        # fingerprints (and therefore finished scans) valid. The search model is
+        # left out: it does not change faces or timelines, and a new one is
+        # applied to finished videos by `ivf reembed`, frames only, rather than
+        # by scanning every video again.
+        if self.objects.enabled:
+            payload["objects"] = self.objects.model_dump(exclude={"model"})
+        return self._hash(payload)
+
+    def _payload(self) -> dict:
+        return {
             # `select` belongs here because live_photos changes which *asset* a
             # face is written to, not merely which videos are looked at. Leaving
             # it out let runs staged under the old behaviour pass the staleness
@@ -309,10 +320,18 @@ class Config(BaseModel):
             "cluster": self.cluster.model_dump(),
             "match": self.match.model_dump(),
         }
-        # Only when switched on, so turning nothing on leaves existing
-        # fingerprints (and therefore finished scans) valid.
-        if self.objects.enabled:
-            payload["objects"] = self.objects.model_dump()
+
+    def legacy_fingerprint(self, model: str) -> str | None:
+        """The fingerprint these settings had when it still included the search
+        model (`objects.model`), for that model. Lets scans made then count as
+        done now (see State.rekey)."""
+        if not self.objects.enabled:
+            return None
+        payload = self._payload()
+        payload["objects"] = self.objects.model_copy(update={"model": model}).model_dump()
+        return self._hash(payload)
+
+    def _hash(self, payload: dict) -> str:
         if self.index.enabled:
             payload["timeline"] = self.timeline.model_dump()
         blob = json.dumps(payload, sort_keys=True).encode()

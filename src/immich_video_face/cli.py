@@ -38,6 +38,23 @@ def _open_index(config: Config):
     return VideoIndex(config)
 
 
+def _rekey(config: Config, state) -> None:
+    """Carry finished scans over from fingerprints that still included the
+    search model (before it was left out), so a model change rescans nothing."""
+    if not config.objects.enabled:
+        return
+    models = {config.objects.model}
+    index = _open_index(config)
+    if index is not None:
+        try:
+            models |= index.frame_models()
+        finally:
+            index.close()
+    moved = state.rekey({config.legacy_fingerprint(m) for m in models}, config.fingerprint)
+    if moved:
+        console.print(f"Carried {moved} finished scans over to fingerprint {config.fingerprint}.")
+
+
 def _owner_id(config: Config, client) -> str:
     return config.immich.owner_id or client.my_user_id()
 
@@ -320,6 +337,7 @@ def scan(
 
     with ImmichDb(cfg) as db, State(cfg.state_db) as state:
         db.assert_schema()
+        _rekey(cfg, state)
         owner = cfg.immich.owner_id or (client.my_user_id() if client else "")
         if not owner:
             console.print("[red]Set immich.owner_id or an api_key in config.[/red]")
@@ -543,6 +561,85 @@ def scan(
 
 
 @app.command()
+def reembed(
+    config: Optional[Path] = _config_option,
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", help="Max videos to re-embed"),
+    verbose: bool = False,
+) -> None:
+    """Re-embed scanned videos' frames with the current search model.
+
+    After a search model change (Immich's Smart Search model, mirrored in
+    objects.model), videos scanned before keep frames from the old model, and
+    search ignores them. This replaces them. Frames only: faces and timelines
+    are left alone, so there is nothing to review.
+    """
+    from .faces import FaceDetector
+    from .immich_db import ImmichDb
+    from .scanner import Scanner
+    from .state import State
+
+    cfg = _setup(config, verbose)
+    if not (cfg.objects.enabled and cfg.index.enabled):
+        console.print("[red]reembed needs objects.enabled and index.enabled.[/red]")
+        raise typer.Exit(1)
+    client = None
+    if cfg.immich.api_key:
+        from .immich_api import ImmichClient
+
+        client = ImmichClient(cfg)
+        if not _check_model(cfg, client):
+            raise typer.Exit(1)
+
+    index = _open_index(cfg)
+    with ImmichDb(cfg) as db, State(cfg.state_db) as state:
+        _rekey(cfg, state)
+        stale = index.stale_videos(cfg.objects.model)
+        if not stale:
+            console.print(f"Nothing to re-embed: every frame uses {cfg.objects.model}.")
+            return
+        owner = cfg.immich.owner_id or (client.my_user_id() if client else "")
+        videos = {video.id: video for video in db.list_videos(owner)}
+        # Frames of videos Immich no longer lists (deleted) can only go.
+        gone = [asset_id for asset_id in stale if asset_id not in videos]
+        for asset_id in gone:
+            index.replace_frames(asset_id=asset_id, frame_embeddings=[], model=cfg.objects.model)
+        todo = [videos[asset_id] for asset_id in stale if asset_id in videos]
+        if limit:
+            todo = todo[:limit]
+        console.print(f"Re-embedding {len(todo)} of {len(stale)} video(s) with {cfg.objects.model}")
+
+        scanner = Scanner(cfg, FaceDetector(cfg.detect, clip_model=cfg.objects.model), None)
+        done = frames = 0
+        failed: list[tuple[str, str]] = []
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("re-embedding", total=len(todo))
+            for video in todo:
+                result = scanner.embed(video)
+                if result.ok:
+                    frames += index.replace_frames(
+                        asset_id=video.id,
+                        frame_embeddings=result.frame_embeddings,
+                        model=cfg.objects.model,
+                    )
+                    done += 1
+                else:
+                    failed.append((video.id, result.error or "unknown error"))
+                progress.advance(task)
+    console.print(f"Re-embedded {done} video(s), {frames} frames.")
+    for asset_id, error in failed:
+        console.print(f"  [yellow]{asset_id}: {error}[/yellow]")
+    left = len(stale) - len(gone) - done
+    if left:
+        console.print(f"{left} video(s) still on an older model.")
+
+
+@app.command()
 def commit(
     config: Optional[Path] = _config_option,
     run: Optional[int] = typer.Option(None, "--run", help="Run id to commit"),
@@ -563,6 +660,7 @@ def commit(
         raise typer.Exit(1)
 
     with ImmichClient(cfg) as client, State(cfg.state_db) as state:
+        _rekey(cfg, state)
         awaiting = state.runs_awaiting_review()
         if run is None:
             if not awaiting:
@@ -669,6 +767,7 @@ def promote(
     listing = selected is None or dry_run
 
     with ImmichClient(cfg) as client, State(cfg.state_db) as state:
+        _rekey(cfg, state)
         owner = cfg.immich.owner_id or client.my_user_id()
 
         into_person = None
@@ -880,6 +979,7 @@ def status(config: Optional[Path] = _config_option) -> None:
 
     cfg = _setup(config)
     with State(cfg.state_db) as state:
+        _rekey(cfg, state)
         summary = state.summary()
         failed = state.failed_assets()
         awaiting = state.runs_awaiting_review()

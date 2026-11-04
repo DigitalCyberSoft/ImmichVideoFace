@@ -301,6 +301,27 @@ class State:
 
     # ---- scan bookkeeping ----------------------------------------------
 
+    def rekey(self, old: set[str], new: str) -> int:
+        """Move scans and runs recorded under fingerprints `old` to `new`.
+
+        For a fingerprint whose definition changed but whose results did not
+        (the search model left it): the work done stays done, and staged runs
+        stay committable. Returns the number of scanned assets moved.
+        """
+        old = {fp for fp in old if fp and fp != new}
+        if not old:
+            return 0
+        marks = ",".join("?" * len(old))
+        with self._conn:
+            moved = self._conn.execute(
+                f"UPDATE scanned_assets SET fingerprint=? WHERE fingerprint IN ({marks})",
+                (new, *old),
+            ).rowcount
+            self._conn.execute(
+                f"UPDATE runs SET fingerprint=? WHERE fingerprint IN ({marks})", (new, *old)
+            )
+        return moved
+
     def already_scanned(self, fingerprint: str, include_failed: bool = True) -> set[str]:
         """Assets that are genuinely done: scanned under the current settings
         *and* settled.

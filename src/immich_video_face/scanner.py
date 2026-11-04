@@ -95,49 +95,15 @@ class Scanner:
         def wants_clip(index: int) -> bool:
             return bool(clip_every) and index % clip_every == 0
 
-        workers = (
-            max(1, self.config.detect.ml_workers)
-            if self.config.detect.backend == "immich-ml"
-            else 1
-        )
         try:
-            if workers == 1:
-                for index, frame in frames_iter:
-                    result.frames += 1
-                    collect(
-                        index,
-                        self.detector.analyse(frame, index, keep_crops, wants_clip(index)),
-                    )
-            else:
-                # Keep several frames in flight so the ML service can work on them
-                # in parallel; results are collected in frame order. Each frame is
-                # its own buffer (ffmpeg output is read into fresh bytes), so it is
-                # safe to hand to another thread.
-                from collections import deque
-                from concurrent.futures import ThreadPoolExecutor
-
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    inflight: deque = deque()
-                    for index, frame in frames_iter:
-                        result.frames += 1
-                        inflight.append(
-                            (
-                                index,
-                                pool.submit(
-                                    self.detector.analyse,
-                                    frame,
-                                    index,
-                                    keep_crops,
-                                    wants_clip(index),
-                                ),
-                            )
-                        )
-                        if len(inflight) >= workers * 2:
-                            done_index, future = inflight.popleft()
-                            collect(done_index, future.result())
-                    while inflight:
-                        done_index, future = inflight.popleft()
-                        collect(done_index, future.result())
+            for index, outcome in self._ordered(
+                frames_iter,
+                lambda frame, index: self.detector.analyse(
+                    frame, index, keep_crops, wants_clip(index)
+                ),
+            ):
+                result.frames += 1
+                collect(index, outcome)
         except Exception as exc:  # pragma: no cover - decode failures vary widely
             result.error = f"decode/detect failed: {exc}"
             return result
@@ -174,6 +140,74 @@ class Scanner:
             }
 
         _log_summary(result, batch)
+        return result
+
+
+    def _ordered(self, frames_iter, work):
+        """Yield (frame index, work(frame, index)) in frame order.
+
+        With the ML service, several frames are kept in flight so it can work
+        on them in parallel. Each frame is its own buffer (ffmpeg output is read
+        into fresh bytes), so it is safe to hand to another thread.
+        """
+        workers = (
+            max(1, self.config.detect.ml_workers)
+            if self.config.detect.backend == "immich-ml"
+            else 1
+        )
+        if workers == 1:
+            for index, frame in frames_iter:
+                yield index, work(frame, index)
+            return
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            inflight: deque = deque()
+            for index, frame in frames_iter:
+                inflight.append((index, pool.submit(work, frame, index)))
+                if len(inflight) >= workers * 2:
+                    done_index, future = inflight.popleft()
+                    yield done_index, future.result()
+            while inflight:
+                done_index, future = inflight.popleft()
+                yield done_index, future.result()
+
+    def embed(self, asset: VideoAsset) -> ScanResult:
+        """Frame embeddings only, for a new search model: no faces, so nothing to
+        review. Samples exactly as `scan` does, so frame times line up."""
+        path = self.config.paths.to_host(asset.original_path)
+        result = ScanResult(asset=asset, path=path)
+        if not path.exists():
+            result.error = f"file not found: {path}"
+            return result
+        try:
+            info = probe(path)
+            frames_iter, batch = iter_frames(path, self.config.sampling, info)
+        except VideoError as exc:
+            result.error = str(exc)
+            return result
+        result.duration_s = info.duration_s
+        fps = max(self.config.sampling.min_fps, 0.1)
+        clip_every = max(1, round(self.config.objects.interval_s * fps))
+        # Only every clip_every-th frame is sent; the rest are decoded and dropped.
+        vectors: list[tuple[int, np.ndarray]] = []
+        try:
+            for index, vector in self._ordered(
+                ((i, f) for i, f in frames_iter if i % clip_every == 0),
+                lambda frame, index: self.detector.embed(frame),
+            ):
+                result.frames += 1
+                if vector is not None:
+                    vectors.append((index, vector))
+        except Exception as exc:  # pragma: no cover - decode failures vary widely
+            result.error = f"decode/embed failed: {exc}"
+            return result
+        result.frame_embeddings = [
+            (batch.timestamp_for(index), vector)
+            for index, vector in vectors
+            if not np.isnan(batch.timestamp_for(index))
+        ]
         return result
 
 

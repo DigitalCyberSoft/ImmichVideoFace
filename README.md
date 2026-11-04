@@ -69,6 +69,12 @@ database role owns. Immich's tables are still never written directly.
   the ML service for a CLIP embedding, in the same request as faces. `objects.model` must
   equal Immich's smart search model; `ivf check` compares them and `ivf scan` refuses on a
   mismatch, as for faces.
+- **Changing the search model.** Set Immich's Smart Search model, re-run Smart Search for
+  all assets in Immich, set `objects.model` to match, then run `ivf reembed`. It replaces
+  the frame embeddings of videos already scanned and leaves faces and timelines alone, so
+  nothing is rescanned or reviewed. Search ignores frames from any other model in the
+  meantime. The model is not part of the scan fingerprint; fingerprints recorded when it
+  was are carried over automatically.
 - **Live Photo motion clips** contribute faces to the still, as upstream, but no frame
   embeddings or timeline, since the clip itself is hidden.
 
@@ -250,6 +256,7 @@ ivf scan --newest  # most recent videos rather than oldest
 ivf promote        # list candidates with the closest known person for each
 ivf duplicates     # people Immich has split into several records
 ivf undo --run N   # remove everything a commit or promote created
+ivf reembed        # after a search model change: new frame embeddings, nothing else
 ivf status         # progress, and whether staged runs are still valid
 ```
 

@@ -142,6 +142,12 @@ class FaceDetector:
         """Detect and embed every face in a single BGR frame."""
         return self.analyse(frame, frame_index, keep_crop)[0]
 
+    def embed(self, frame: np.ndarray) -> np.ndarray | None:
+        """The frame's CLIP embedding alone, without face detection."""
+        if self._ml is None or not self.clip_model:
+            raise ValueError("Object search needs detect.backend = \"immich-ml\"")
+        return self._ml.predict(frame, clip_model=self.clip_model, faces=False)[1]
+
     def analyse(
         self,
         frame: np.ndarray,
@@ -223,13 +229,13 @@ class ImmichMlClient:
         return self.predict(frame)[0]
 
     def predict(
-        self, frame: np.ndarray, clip_model: str | None = None
+        self, frame: np.ndarray, clip_model: str | None = None, faces: bool = True
     ) -> tuple[list[tuple[tuple[float, float, float, float], float, np.ndarray]], np.ndarray | None]:
         import cv2
 
         from .immich_db import normalise, parse_vector
 
-        entries: dict = {"facial-recognition": self._faces_entry}
+        entries: dict = {"facial-recognition": self._faces_entry} if faces else {}
         if clip_model:
             entries["clip"] = {"visual": {"modelName": clip_model}}
         ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])

@@ -41,3 +41,20 @@ def test_fingerprint_ignores_how_the_ml_service_is_reached():
     a = resolved(gpu=False, detect={"ml_workers": 2})
     b = resolved(gpu=False, detect={"ml_workers": 8, "ml_url": "http://ml:3003"})
     assert a.fingerprint == b.fingerprint
+
+
+def test_search_model_change_keeps_the_fingerprint():
+    a = resolved(gpu=False, objects={"enabled": True, "model": "ViT-B-32__openai"})
+    b = resolved(gpu=False, objects={"enabled": True, "model": "ViT-SO400M-16-SigLIP2-384__webli"})
+    assert a.fingerprint == b.fingerprint
+    # ...but the interval still counts: it changes which frames are embedded.
+    c = resolved(gpu=False, objects={"enabled": True, "interval_s": 4.0})
+    assert c.fingerprint != a.fingerprint
+
+
+def test_legacy_fingerprint_is_per_model():
+    cfg = resolved(gpu=False, objects={"enabled": True, "model": "ViT-B-32__openai"})
+    old = cfg.legacy_fingerprint("ViT-B-32__openai")
+    assert old and old != cfg.fingerprint
+    assert old != cfg.legacy_fingerprint("ViT-SO400M-16-SigLIP2-384__webli")
+    assert resolved(gpu=False).legacy_fingerprint("ViT-B-32__openai") is None
