@@ -10,7 +10,8 @@ roughly two orders of magnitude.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -28,6 +29,9 @@ MAX_OBSERVATIONS = 6000
 class FaceCluster:
     observations: list[Observation]
     centroid: np.ndarray  # L2-normalised
+    # When this face is on screen: [(start_s, end_s), ...], filled in by the
+    # scanner once frame timestamps are known.
+    segments: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def size(self) -> int:
@@ -46,6 +50,52 @@ class FaceCluster:
     def time_range(self, frames) -> tuple[float, float]:
         start, end = self.frame_range()
         return frames.timestamp_for(start), frames.timestamp_for(end)
+
+    def time_segments(self, frames, gap_s: float, pad_s: float) -> list[tuple[float, float]]:
+        times = [frames.timestamp_for(o.frame_index) for o in self.observations]
+        return time_segments(times, gap_s=gap_s, pad_s=pad_s)
+
+
+def time_segments(
+    times: list[float], *, gap_s: float, pad_s: float, duration_s: float | None = None
+) -> list[tuple[float, float]]:
+    """Turn the timestamps a face was seen at into on-screen intervals.
+
+    A face is sampled, not tracked, so each sighting stands for roughly one
+    sampling interval: `pad_s` (half an interval) is added either side. A gap
+    longer than `gap_s` between sightings ends one appearance and starts the next.
+    """
+    clean = sorted(t for t in times if not math.isnan(t))
+    if not clean:
+        return []
+    segments: list[list[float]] = [[clean[0], clean[0]]]
+    for t in clean[1:]:
+        if t - segments[-1][1] > gap_s:
+            segments.append([t, t])
+        else:
+            segments[-1][1] = t
+    out = []
+    for start, end in segments:
+        start = max(0.0, start - pad_s)
+        end = end + pad_s
+        if duration_s:
+            end = min(end, duration_s)
+        out.append((round(start, 3), round(end, 3)))
+    return merge_segments(out)
+
+
+def merge_segments(
+    segments: list[tuple[float, float]], gap_s: float = 0.0
+) -> list[tuple[float, float]]:
+    """Union of intervals, sorted. Overlapping ones, and ones separated by no more
+    than `gap_s`, become one."""
+    merged: list[list[float]] = []
+    for start, end in sorted(segments):
+        if merged and start <= merged[-1][1] + gap_s:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(s, e) for s, e in merged]
 
 
 def cluster_observations(

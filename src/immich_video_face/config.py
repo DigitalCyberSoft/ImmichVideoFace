@@ -82,11 +82,24 @@ class DbSettings(BaseModel):
             raise RuntimeError(f"Container {container!r} has no network address.")
         return ips[0]
 
-    def dsn(self) -> str:
-        return (
-            f"postgresql://{self.user}:{self.password}"
-            f"@{self.resolve_host()}:{self.port}/{self.name}"
-        )
+    def conninfo(self) -> str:
+        """libpq connection string.
+
+        Built from keywords rather than a URL so that `host` may be a Unix socket
+        directory (e.g. /run/postgresql) and `password` may be left blank for peer
+        authentication -- the natural setup when Immich runs without containers.
+        """
+        from psycopg.conninfo import make_conninfo
+
+        params = {
+            "host": self.resolve_host(),
+            "port": self.port,
+            "dbname": self.name,
+            "user": self.user,
+        }
+        if self.password:
+            params["password"] = self.password
+        return make_conninfo(**params)
 
 
 class SelectSettings(BaseModel):
@@ -117,6 +130,16 @@ class SamplingSettings(BaseModel):
 
 
 class DetectSettings(BaseModel):
+    # Where detection and embedding run:
+    #   insightface - in this process, with InsightFace and onnxruntime (GPU or CPU)
+    #   immich-ml   - Immich's own machine-learning service, over HTTP. Embeddings
+    #                 then come from the exact code Immich uses for photos, no second
+    #                 copy of the models is loaded, and no GPU stack is needed.
+    backend: Literal["insightface", "immich-ml"] = "insightface"
+    # immich-ml only: the service URL, and how many frames to have in flight.
+    # The service runs requests in parallel, so a few workers keep every core busy.
+    ml_url: str = "http://127.0.0.1:3003"
+    ml_workers: int = 2
     model: str = "buffalo_l"
     min_score: float = 0.7
     device: str = "cuda"
@@ -127,6 +150,44 @@ class DetectSettings(BaseModel):
     # clustering, and on real footage discarding them cost no matches while
     # cutting cluster count by 2-4x.
     min_face_px: int = 40
+
+
+class ObjectSettings(BaseModel):
+    """Object search across the whole video, not just its thumbnail.
+
+    Every `interval_s` of video, the frame is also sent for a CLIP embedding -- the
+    same vector Immich's smart search stores for a photo. They are published to the
+    video index (see `IndexSettings`), where a patched Immich ranks a video by its
+    best-matching frame. Needs `detect.backend = "immich-ml"`.
+    """
+
+    enabled: bool = False
+    interval_s: float = 2.0
+    # MUST match Immich's smart search model (Administration -> Settings ->
+    # Machine Learning -> Smart Search). `ivf check` compares the two.
+    model: str = "ViT-B-32__openai"
+
+
+class TimelineSettings(BaseModel):
+    """When each person is on screen."""
+
+    # Someone absent from the sampled frames for longer than this starts a new
+    # appearance. A little over the sampling interval bridges a missed detection
+    # (a turned head, motion blur) without merging separate appearances.
+    gap_s: float = 3.0
+
+
+class IndexSettings(BaseModel):
+    """Publish frame embeddings and appearance times to Postgres.
+
+    Everything goes into one schema that the tool's own database role owns, so
+    Immich's tables are still never written. Immich ignores the schema unless it
+    carries the matching patch, which reads it for smart search and the
+    people-in-this-video timeline.
+    """
+
+    enabled: bool = False
+    schema_name: str = "ivf"
 
 
 class ClusterSettings(BaseModel):
@@ -179,6 +240,9 @@ class Config(BaseModel):
     cluster: ClusterSettings = Field(default_factory=ClusterSettings)
     match: MatchSettings = Field(default_factory=MatchSettings)
     writeback: WritebackSettings = Field(default_factory=WritebackSettings)
+    objects: ObjectSettings = Field(default_factory=ObjectSettings)
+    timeline: TimelineSettings = Field(default_factory=TimelineSettings)
+    index: IndexSettings = Field(default_factory=IndexSettings)
 
     state_db: Path = Path("ivf-state.sqlite3")
     report_dir: Path = Path("reports")
@@ -201,6 +265,12 @@ class Config(BaseModel):
             "cluster": self.cluster.model_dump(),
             "match": self.match.model_dump(),
         }
+        # Only when switched on, so turning nothing on leaves existing
+        # fingerprints (and therefore finished scans) valid.
+        if self.objects.enabled:
+            payload["objects"] = self.objects.model_dump()
+        if self.index.enabled:
+            payload["timeline"] = self.timeline.model_dump()
         blob = json.dumps(payload, sort_keys=True).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
 

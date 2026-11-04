@@ -37,7 +37,6 @@ REQUIRED_SCHEMA: dict[str, set[str]] = {
     "asset_face": {
         "id",
         "assetId",
-        "personId",
         "deletedAt",
         "isVisible",
         "sourceType",
@@ -48,8 +47,18 @@ REQUIRED_SCHEMA: dict[str, set[str]] = {
         "boundingBoxX2",
         "boundingBoxY2",
     },
-    "person": {"id", "name", "ownerId", "isHidden", "faceAssetId"},
+    "person": {"name", "ownerId", "isHidden", "faceAssetId"},
     "face_search": {"faceId", "embedding"},
+}
+
+# How a face points at its person. Immich v3.3 moved identity into person
+# groups: `asset_face.personGroupId` replaced `asset_face.personId`, `person`
+# lost its own `id`, and the API's person id is now the group id. Both layouts
+# are supported; `ImmichDb` detects which one it is talking to.
+#   (asset_face column, person column it joins to)
+PERSON_LINKS = {
+    "person-groups": ("personGroupId", "personGroupId"),  # Immich >= 3.3
+    "person-ids": ("personId", "id"),  # Immich <= 3.2
 }
 
 
@@ -93,12 +102,41 @@ class ImmichDb:
     def __init__(self, config: Config) -> None:
         self.config = config
         self._conn = psycopg.connect(
-            config.db.dsn(),
+            config.db.conninfo(),
             row_factory=dict_row,
             # Belt and braces: the app must never mutate Immich's database.
             autocommit=True,
         )
         self._conn.read_only = True
+        self.layout = self._detect_layout()
+        self._face_col, self._person_col = PERSON_LINKS[self.layout]
+
+    def _detect_layout(self) -> str:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'asset_face'
+                  AND column_name IN ('personGroupId', 'personId')
+                """
+            )
+            columns = {row["column_name"] for row in cur.fetchall()}
+        if "personGroupId" in columns:
+            return "person-groups"
+        if "personId" in columns:
+            return "person-ids"
+        raise RuntimeError(
+            "Immich database schema does not match what this tool expects: "
+            "asset_face has neither personGroupId nor personId."
+        )
+
+    def _person_join(self, face: str = "af", person: str = "p") -> str:
+        """SQL joining a face alias to its person alias, for either layout."""
+        return f'{person}."{self._person_col}" = {face}."{self._face_col}"'
+
+    @property
+    def _face_person(self) -> str:
+        return f'af."{self._face_col}"'
 
     def close(self) -> None:
         self._conn.close()
@@ -125,8 +163,12 @@ class ImmichDb:
             for row in cur.fetchall():
                 found.setdefault(row["table_name"], set()).add(row["column_name"])
 
+        required = {table: set(columns) for table, columns in REQUIRED_SCHEMA.items()}
+        required["asset_face"].add(self._face_col)
+        required["person"].add(self._person_col)
+
         problems: list[str] = []
-        for table, columns in REQUIRED_SCHEMA.items():
+        for table, columns in required.items():
             if table not in found:
                 problems.append(f"missing table {table!r}")
                 continue
@@ -148,12 +190,12 @@ class ImmichDb:
         so faces this tool writes never get a `face_search` row and therefore
         can never feed back into future matching.
         """
-        sql = """
-            SELECT af."personId" AS person_id, p.name AS name, fs.embedding AS embedding
+        sql = f"""
+            SELECT {self._face_person} AS person_id, p.name AS name, fs.embedding AS embedding
             FROM face_search fs
             JOIN asset_face af ON af.id = fs."faceId"
-            JOIN person p      ON p.id = af."personId"
-            WHERE af."personId" IS NOT NULL
+            JOIN person p      ON {self._person_join()}
+            WHERE {self._face_person} IS NOT NULL
               AND af."deletedAt" IS NULL
               AND af."isVisible" IS TRUE
               AND p."isHidden" IS FALSE
@@ -195,8 +237,8 @@ class ImmichDb:
         """Named faces on *image* assets, for embedding-space verification."""
         with self._conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT af.id AS face_id, af."personId" AS person_id, p.name AS name,
+                f"""
+                SELECT af.id AS face_id, {self._face_person} AS person_id, p.name AS name,
                        a.id AS asset_id, a."originalPath" AS original_path,
                        pf.path AS preview_path,
                        af."imageWidth" AS image_width, af."imageHeight" AS image_height,
@@ -205,7 +247,7 @@ class ImmichDb:
                        fs.embedding AS embedding
                 FROM face_search fs
                 JOIN asset_face af ON af.id = fs."faceId"
-                JOIN person p      ON p.id = af."personId"
+                JOIN person p      ON {self._person_join()}
                 JOIN asset a       ON a.id = af."assetId"
                 LEFT JOIN asset_file pf ON pf."assetId" = a.id AND pf.type = 'preview'
                 WHERE p.name <> ''

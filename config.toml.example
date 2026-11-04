@@ -34,6 +34,11 @@ max_long_edge = 960
 max_frames = 3000
 
 [detect]
+# insightface - in-process InsightFace (GPU recommended)
+# immich-ml   - Immich's own ML service; no GPU stack, identical embeddings
+backend = "insightface"
+ml_url = "http://127.0.0.1:3003"   # immich-ml: the service Immich's server talks to
+ml_workers = 2                     # immich-ml: frames in flight; ~cores/1.5 on CPU
 # MUST match Immich's own model (Administration -> Settings -> Machine Learning
 # -> Facial Recognition). A different model means a different vector space and
 # every match becomes nonsense. `ivf check` compares the two and `ivf scan`
@@ -62,3 +67,20 @@ enabled = true
 bank_unmatched = true       # local only; people are created by `ivf promote <numbers>`
 promote_min_assets = 3      # videos a face must recur across to be offered
 tag = "VideoFaceScan/scanned"
+
+# ---- fork additions: the video index ---------------------------------------
+
+[objects]
+# A CLIP embedding every interval_s of video, for object search (immich-ml only).
+enabled = false
+interval_s = 2.0
+model = "ViT-B-32__openai"   # MUST match Immich's smart search model
+
+[timeline]
+gap_s = 3.0                  # an absence longer than this starts a new appearance
+
+[index]
+# Publish appearance times and frame embeddings to a schema this tool's DB role
+# owns (see README, "The video index"). Immich's tables are never written.
+enabled = false
+schema_name = "ivf"

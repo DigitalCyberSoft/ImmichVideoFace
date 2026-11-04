@@ -108,6 +108,15 @@ class ImmichClient:
         facial = (data.get("machineLearning") or {}).get("facialRecognition") or {}
         return facial.get("modelName")
 
+    def clip_model(self) -> str | None:
+        """Immich's smart search (CLIP) model, or None without admin rights."""
+        try:
+            data = self._request("GET", "/system-config").json()
+        except ImmichError:
+            return None
+        clip = (data.get("machineLearning") or {}).get("clip") or {}
+        return clip.get("modelName")
+
     def server_version(self) -> str:
         data = self._request("GET", "/server/version").json()
         return f"{data.get('major')}.{data.get('minor')}.{data.get('patch')}"

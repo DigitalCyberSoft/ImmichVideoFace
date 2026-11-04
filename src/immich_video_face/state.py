@@ -12,9 +12,10 @@ later and take them back.
 from __future__ import annotations
 
 import contextlib
+import json
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
@@ -162,6 +163,9 @@ class PendingWrite:
     image_size: tuple[int, int]
     box: tuple[int, int, int, int]
     distance: float
+    # On-screen intervals in seconds; empty when the timeline does not apply
+    # (a Live Photo clip whose face is written onto the still).
+    segments: list[tuple[float, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -174,6 +178,7 @@ class UnmatchedCluster:
     box: tuple[int, int, int, int]
     crop_jpeg: bytes | None = None
     group_no: int | None = None
+    segments: list[tuple[float, float]] = field(default_factory=list)
 
 
 class State:
@@ -195,6 +200,13 @@ class State:
             self._conn.execute("ALTER TABLE unmatched_clusters ADD COLUMN crop_jpeg BLOB")
         if "group_no" not in existing:
             self._conn.execute("ALTER TABLE unmatched_clusters ADD COLUMN group_no INTEGER")
+        if "segments" not in existing:
+            self._conn.execute("ALTER TABLE unmatched_clusters ADD COLUMN segments TEXT")
+        pending_cols = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(pending_writes)")
+        }
+        if "segments" not in pending_cols:
+            self._conn.execute("ALTER TABLE pending_writes ADD COLUMN segments TEXT")
 
         scanned_cols = {
             row["name"] for row in self._conn.execute("PRAGMA table_info(scanned_assets)")
@@ -423,14 +435,16 @@ class State:
         distance: float,
         margin: float,
         observations: int,
+        segments: list[tuple[float, float]] | None = None,
     ) -> None:
         with self._write() as conn:
             conn.execute(
                 """
                 INSERT INTO pending_writes
                     (run_id, asset_id, person_id, person_name, image_width, image_height,
-                     x, y, width, height, distance, margin, observations, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     x, y, width, height, distance, margin, observations, created_at,
+                     segments)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(run_id, asset_id, person_id) DO NOTHING
                 """,
                 (
@@ -446,6 +460,7 @@ class State:
                     None if margin == float("inf") else margin,
                     observations,
                     time.time(),
+                    _dump_segments(segments),
                 ),
             )
 
@@ -481,6 +496,7 @@ class State:
                 image_size=(row["image_width"], row["image_height"]),
                 box=(row["x"], row["y"], row["width"], row["height"]),
                 distance=float(row["distance"] or 0.0),
+                segments=_load_segments(row["segments"]),
             )
             for row in rows
         ]
@@ -493,6 +509,20 @@ class State:
                 "UPDATE pending_writes SET committed_at=? WHERE id=?",
                 [(time.time(), pid) for pid in pending_ids],
             )
+
+    def committed_people(self, commit_run_id: int) -> list[tuple[str, str]]:
+        """(asset, person) pairs a commit run applied, whether written or already there.
+
+        Staged rows belong to the scan run that produced them; a commit run marks
+        them with its own time window, which is how they are found again here.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT p.asset_id, p.person_id FROM pending_writes p "
+            "JOIN runs r ON r.id = ? AND r.mode = 'commit' "
+            "WHERE p.committed_at BETWEEN r.started_at AND coalesce(r.finished_at, 1e18)",
+            (commit_run_id,),
+        ).fetchall()
+        return [(row["asset_id"], row["person_id"]) for row in rows]
 
     def runs_awaiting_review(self) -> list[tuple[int, int]]:
         """(run_id, pending count) for runs with staged, uncommitted writes."""
@@ -514,14 +544,15 @@ class State:
         box: tuple[int, int, int, int],
         best_distance: float,
         crop_jpeg: bytes | None = None,
+        segments: list[tuple[float, float]] | None = None,
     ) -> None:
         with self._write() as conn:
             conn.execute(
                 """
                 INSERT INTO unmatched_clusters
                     (run_id, asset_id, embedding, observations, image_width, image_height,
-                     x, y, width, height, best_distance, created_at, crop_jpeg)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     x, y, width, height, best_distance, created_at, crop_jpeg, segments)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     run_id,
@@ -534,6 +565,7 @@ class State:
                     best_distance,
                     time.time(),
                     crop_jpeg,
+                    _dump_segments(segments),
                 ),
             )
 
@@ -575,6 +607,7 @@ class State:
                 box=(row["x"], row["y"], row["width"], row["height"]),
                 crop_jpeg=row["crop_jpeg"],
                 group_no=row["group_no"],
+                segments=_load_segments(row["segments"]),
             )
             for row in rows
         ]
@@ -717,3 +750,13 @@ class State:
             ),
             "runs": scalar("SELECT count(*) FROM runs"),
         }
+
+
+def _dump_segments(segments: list[tuple[float, float]] | None) -> str | None:
+    return json.dumps([[float(a), float(b)] for a, b in segments]) if segments else None
+
+
+def _load_segments(raw: str | None) -> list[tuple[float, float]]:
+    if not raw:
+        return []
+    return [(float(a), float(b)) for a, b in json.loads(raw)]

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -23,6 +23,8 @@ class MatchResult:
     # Distance to the next-best *different* person; a small gap means the
     # identification was nearly a coin flip and is worth reviewing.
     runner_up_distance: float
+    # On-screen intervals, merged across every cluster that matched this person.
+    segments: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def matched(self) -> bool:
@@ -130,6 +132,8 @@ class Matcher:
 
     def match_all(self, clusters: list[FaceCluster]) -> list[MatchResult]:
         results = [self.match(cluster) for cluster in clusters]
+        for result in results:
+            result.segments = list(result.cluster.segments)
         return _resolve_duplicates(results)
 
 
@@ -169,13 +173,18 @@ def _resolve_duplicates(results: list[MatchResult]) -> list[MatchResult]:
     split (a lighting or angle change). Writing both would create duplicate
     faces on the same asset for the same person.
     """
+    from .cluster import merge_segments
+
     best_by_person: dict[str, MatchResult] = {}
+    segments_by_person: dict[str, list] = {}
     unmatched: list[MatchResult] = []
     for result in results:
         if not result.matched:
             unmatched.append(result)
             continue
         assert result.person_id is not None
+        # The split clusters are all this person, so all of their screen time counts.
+        segments_by_person.setdefault(result.person_id, []).extend(result.segments)
         current = best_by_person.get(result.person_id)
         if current is None or result.distance < current.distance:
             if current is not None:
@@ -186,4 +195,6 @@ def _resolve_duplicates(results: list[MatchResult]) -> list[MatchResult]:
                     current.distance,
                 )
             best_by_person[result.person_id] = result
+    for person_id, kept in best_by_person.items():
+        kept.segments = merge_segments(segments_by_person[person_id])
     return sorted(best_by_person.values(), key=lambda r: r.distance) + unmatched

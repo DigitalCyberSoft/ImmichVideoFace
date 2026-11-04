@@ -29,6 +29,15 @@ def _setup(config_path: Optional[Path], verbose: bool = False) -> Config:
     return load_config(config_path)
 
 
+def _open_index(config: Config):
+    """The video index, when publishing is switched on."""
+    if not config.index.enabled:
+        return None
+    from .video_index import VideoIndex
+
+    return VideoIndex(config)
+
+
 def _owner_id(config: Config, client) -> str:
     return config.immich.owner_id or client.my_user_id()
 
@@ -48,6 +57,15 @@ def _check_model(config: Config, client) -> bool:
         )
         return True
     if theirs == config.detect.model:
+        if config.objects.enabled:
+            clip = client.clip_model()
+            if clip is not None and clip != config.objects.model:
+                console.print(
+                    f"[red]Search model mismatch:[/red] Immich uses [bold]{clip}[/bold], "
+                    f"this tool is set to [bold]{config.objects.model}[/bold]. "
+                    f"Set objects.model = \"{clip}\" in config.toml."
+                )
+                return False
         return True
     console.print(
         f"[red]Model mismatch:[/red] Immich uses [bold]{theirs}[/bold], "
@@ -108,9 +126,21 @@ def check(config: Optional[Path] = _config_option, verbose: bool = False) -> Non
                 f"[red]{cfg.detect.model} vs Immich's {theirs} - MISMATCH[/red]",
             )
 
+        if cfg.objects.enabled:
+            clip = client.clip_model()
+            if clip is None:
+                table.add_row("Search model", f"{cfg.objects.model} (Immich's not readable)")
+            elif clip == cfg.objects.model:
+                table.add_row("Search model", f"[green]{clip}[/green] (matches Immich)")
+            else:
+                table.add_row(
+                    "Search model",
+                    f"[red]{cfg.objects.model} vs Immich's {clip} - MISMATCH[/red]",
+                )
+
         with ImmichDb(cfg) as db:
             db.assert_schema()
-            table.add_row("DB schema", "[green]ok[/green]")
+            table.add_row("DB schema", f"[green]ok[/green] ({db.layout})")
             stats = db.person_stats(owner)
             table.add_row("People", f"{stats['total']} ({stats['named']} named)")
             gallery = db.load_gallery(owner)
@@ -119,6 +149,15 @@ def check(config: Optional[Path] = _config_option, verbose: bool = False) -> Non
                 f"{gallery.face_count} faces across {len(gallery)} people",
             )
 
+    if cfg.index.enabled:
+        index = _open_index(cfg)
+        stats = index.stats()
+        index.close()
+        table.add_row(
+            "Video index",
+            f"schema {cfg.index.schema_name}: {stats.videos} videos, "
+            f"{stats.frames} frames, {stats.appearances} appearances",
+        )
     table.add_row("Library root", cfg.paths.data_root_host)
     table.add_row("Config fingerprint", cfg.fingerprint)
     console.print(table)
@@ -311,12 +350,15 @@ def scan(
             f"[{'newest first' if newest else 'oldest first'}]"
         )
 
-        detector = FaceDetector(cfg.detect)
+        detector = FaceDetector(
+            cfg.detect, clip_model=cfg.objects.model if cfg.objects.enabled else None
+        )
         scanner = Scanner(cfg, detector, Matcher(gallery, cfg.match))
+        index = _open_index(cfg)
         run_id = state.start_run(cfg.fingerprint, "scan")
 
         results = []
-        totals = {"staged": 0, "banked": 0, "matched": 0, "superseded": 0}
+        totals = {"staged": 0, "banked": 0, "matched": 0, "superseded": 0, "clip_frames": 0}
 
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -330,6 +372,22 @@ def scan(
                 result = scanner.scan(candidate, keep_crops=report)
                 results.append(result)
                 totals["matched"] += len(result.matched)
+
+                # Object search needs no review: frame embeddings only change which
+                # videos a search can find, so they are published straight away.
+                if index is not None and result.ok and not candidate.still_asset_id:
+                    index.replace_video(
+                        asset_id=candidate.id,
+                        duration_s=result.duration_s,
+                        frames=result.frames,
+                        frame_embeddings=result.frame_embeddings,
+                        model=cfg.objects.model,
+                        fingerprint=cfg.fingerprint,
+                    )
+                    totals["clip_frames"] += len(result.frame_embeddings)
+
+                # A Live Photo clip's faces land on the still, which has no timeline.
+                timeline = not candidate.still_asset_id
 
                 # This scan's result for the asset replaces any older staging of
                 # it, so an asset is never awaiting review in two runs at once.
@@ -352,6 +410,7 @@ def scan(
                         distance=match.distance,
                         margin=match.margin,
                         observations=match.cluster.size,
+                        segments=match.segments if timeline else None,
                     )
                     totals["staged"] += 1
 
@@ -374,6 +433,7 @@ def scan(
                             box=box,
                             best_distance=match.distance,
                             crop_jpeg=encode_crop(match.cluster.best.crop),
+                            segments=match.segments if timeline else None,
                         )
                         totals["banked"] += 1
 
@@ -403,6 +463,13 @@ def scan(
             f"{len(failures)} failed"
         )
         console.print(f"staged {totals['staged']} face(s) for review - nothing written yet")
+        if index is not None:
+            console.print(
+                f"indexed {totals['clip_frames']} frame(s) for object search"
+                if cfg.objects.enabled
+                else "object search off; videos recorded in the index"
+            )
+            index.close()
         if totals["superseded"]:
             console.print(
                 f"replaced {totals['superseded']} face(s) staged for these assets "
@@ -525,8 +592,11 @@ def commit(
             raise typer.Abort()
 
         commit_run = state.start_run(cfg.fingerprint, "commit", notes=f"from scan {run}")
-        writer = Writer(cfg, client, state, commit_run)
+        index = _open_index(cfg)
+        writer = Writer(cfg, client, state, commit_run, index=index)
         outcome = writer.commit(pending)
+        if index is not None:
+            index.close()
         state.finish_run(commit_run)
 
         # The batch is dealt with, so the next scan moves on to new videos.
@@ -614,6 +684,7 @@ def promote(
             detector=detector,
             only_groups=selected,
             into_person=into_person,
+            index=None if listing else _open_index(cfg),
         )
         state.finish_run(run_id)
 
@@ -703,7 +774,7 @@ def undo(
         if not yes and not typer.confirm("Proceed?"):
             raise typer.Abort()
 
-        outcome = undo_run(cfg, client, state, run_id)
+        outcome = undo_run(cfg, client, state, run_id, index=_open_index(cfg))
         console.print(
             f"deleted {outcome.faces_deleted} faces "
             f"({outcome.faces_missing} already gone), "

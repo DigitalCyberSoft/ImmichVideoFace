@@ -72,12 +72,15 @@ class Writer:
         state: State,
         run_id: int,
         detector: FaceDetector | None = None,
+        index=None,
     ) -> None:
         self.config = config
         self.client = client
         self.state = state
         self.run_id = run_id
         self.detector = detector
+        # VideoIndex, when publishing appearance times for the video timeline.
+        self.index = index
         self._tag_id: str | None = None
 
     # ---- tags -----------------------------------------------------------
@@ -116,10 +119,14 @@ class Writer:
                 continue
 
             wrote_here = False
+            # Everyone now on the asset because of this batch, written or already
+            # there; their appearance times are published below.
+            present: list = []
             for item in items:
                 if item.person_id in existing:
                     outcome.faces_skipped += 1
                     committed.append(item.id)
+                    present.append(item)
                     continue
 
                 x, y, width, height = item.box
@@ -154,7 +161,11 @@ class Writer:
                 )
                 outcome.faces_written += 1
                 committed.append(item.id)
+                present.append(item)
                 wrote_here = True
+
+            if self.index is not None:
+                publish_appearances(self.client, self.index, asset_id, present)
 
             if tag_id and wrote_here:
                 self.client.tag_assets(tag_id, [asset_id])
@@ -217,6 +228,40 @@ class Writer:
                 (width, height),
             )
         return anchors
+
+
+def publish_appearances(client: ImmichClient, index, asset_id: str, items: list) -> int:
+    """Record when each of these people is on screen in this video.
+
+    `items` need `person_id`, `segments` and optionally `distance`. Each row is
+    tied to the face that now carries the person on the asset, so the timeline
+    keeps following it if the person is later merged or the face reassigned.
+    """
+    from .video_index import resolve_face_ids
+
+    items = [item for item in items if getattr(item, "segments", None)]
+    if not items:
+        return 0
+    try:
+        face_ids = resolve_face_ids(client.get_faces(asset_id))
+    except Exception as exc:
+        log.warning("Could not read faces for %s; timeline rows keep person ids only: %s",
+                    asset_id, exc)
+        face_ids = {}
+    published = 0
+    for item in items:
+        try:
+            index.upsert_appearance(
+                asset_id=asset_id,
+                person_id=item.person_id,
+                face_id=face_ids.get(item.person_id),
+                segments=item.segments,
+                distance=getattr(item, "distance", None),
+            )
+            published += 1
+        except Exception as exc:
+            log.warning("Could not publish appearance on %s: %s", asset_id, exc)
+    return published
 
 
 # ---- promotion of unmatched clusters --------------------------------------
@@ -342,6 +387,7 @@ def promote_unmatched(
     detector: FaceDetector | None = None,
     only_groups: list[int] | None = None,
     into_person: str | None = None,
+    index=None,
 ) -> tuple[PromoteOutcome, list[tuple[int, list]]]:
     """Attach qualifying cross-video groups to a person.
 
@@ -445,9 +491,33 @@ def promote_unmatched(
                 client.tag_assets(tag_id, [member.asset_id])
                 state.record_tag(run_id, member.asset_id, tag_id)
 
+        if index is not None:
+            from .cluster import merge_segments
+
+            # A group can hold several clusters from one video; all of them are
+            # this person, so their screen time is merged per video.
+            by_asset: dict[str, list] = {}
+            for member in members:
+                by_asset.setdefault(member.asset_id, []).extend(member.segments)
+            for asset_id, segments in by_asset.items():
+                if segments:
+                    publish_appearances(
+                        client,
+                        index,
+                        asset_id,
+                        [_Appearance(person_id, merge_segments(segments), None)],
+                    )
+
         state.mark_promoted([m.id for m in members], person_id)
 
     return outcome, groups
+
+
+@dataclass
+class _Appearance:
+    person_id: str
+    segments: list
+    distance: float | None
 
 
 # ---- undo ----------------------------------------------------------------
@@ -464,7 +534,7 @@ class UndoOutcome:
 
 
 def undo_run(
-    config: Config, client: ImmichClient, state: State, run_id: int
+    config: Config, client: ImmichClient, state: State, run_id: int, index=None
 ) -> UndoOutcome:
     """Remove everything a run wrote.
 
@@ -478,6 +548,20 @@ def undo_run(
     by_asset: dict[str, list] = {}
     for face in written:
         by_asset.setdefault(face.asset_id, []).append(face)
+
+    if index is not None:
+        # Appearance rows this run published, whether it wrote the face or the
+        # person was already on the asset.
+        for asset_id, person_id in state.committed_people(run_id):
+            try:
+                index.delete_appearance(asset_id, person_id)
+            except Exception as exc:
+                log.warning("Could not remove appearance on %s: %s", asset_id, exc)
+        for face in written:
+            try:
+                index.delete_appearance(face.asset_id, face.person_id)
+            except Exception as exc:
+                log.warning("Could not remove appearance on %s: %s", face.asset_id, exc)
 
     for asset_id, records in by_asset.items():
         try:

@@ -78,9 +78,23 @@ def preload_cuda_libraries() -> None:
 
 
 class FaceDetector:
-    def __init__(self, settings: DetectSettings) -> None:
+    def __init__(self, settings: DetectSettings, clip_model: str | None = None) -> None:
         self.settings = settings
-        self._app = self._build()
+        self.clip_model = clip_model
+        self._ml: ImmichMlClient | None = None
+        if clip_model and settings.backend != "immich-ml":
+            raise ValueError("Object search needs detect.backend = \"immich-ml\"")
+        if settings.backend == "immich-ml":
+            self._ml = ImmichMlClient(settings)
+            self._app = None
+            self.active_provider = f"immich-ml ({settings.ml_url})"
+            log.info("Using Immich machine learning at %s, model %s", settings.ml_url, settings.model)
+        else:
+            self._app = self._build()
+
+    def close(self) -> None:
+        if self._ml is not None:
+            self._ml.close()
 
     def _build(self):
         if self.settings.device == "cuda":
@@ -126,16 +140,37 @@ class FaceDetector:
         self, frame: np.ndarray, frame_index: int = 0, keep_crop: bool = False
     ) -> list[Observation]:
         """Detect and embed every face in a single BGR frame."""
-        faces = self._app.get(frame)
+        return self.analyse(frame, frame_index, keep_crop)[0]
+
+    def analyse(
+        self,
+        frame: np.ndarray,
+        frame_index: int = 0,
+        keep_crop: bool = False,
+        clip: bool = False,
+    ) -> tuple[list[Observation], np.ndarray | None]:
+        """Faces in a frame and, when `clip` is set, the frame's CLIP embedding.
+
+        Both come from a single request to the ML service, so object search adds
+        no extra decoding and only one more model pass per sampled frame.
+        """
+        clip_vector = None
+        if self._ml is not None:
+            faces, clip_vector = self._ml.predict(
+                frame, clip_model=self.clip_model if clip else None
+            )
+        else:
+            faces = [
+                (tuple(float(v) for v in face.bbox), float(face.det_score),
+                 getattr(face, "normed_embedding", None))
+                for face in self._app.get(frame)
+            ]
         observations: list[Observation] = []
-        for face in faces:
-            score = float(face.det_score)
+        for box, score, embedding in faces:
             if score < self.settings.min_score:
                 continue
-            embedding = getattr(face, "normed_embedding", None)
             if embedding is None:
                 continue
-            box = tuple(float(v) for v in face.bbox)
             if max(box[2] - box[0], box[3] - box[1]) < self.settings.min_face_px:
                 continue
             patch = crop(frame, box)
@@ -150,7 +185,75 @@ class FaceDetector:
                     crop=patch.copy() if keep_crop else None,
                 )
             )
-        return observations
+        return observations, clip_vector
+
+
+class ImmichMlClient:
+    """Detection and recognition through Immich's machine-learning service.
+
+    This is the same endpoint Immich's server calls for photos
+    (`POST /predict` with an `entries` JSON and an `image` file), so the boxes,
+    scores and embeddings are produced exactly as Immich's own are. Frames are
+    sent as high-quality JPEG; Immich itself runs face detection on JPEG
+    previews, so this matches how the stored gallery was made.
+    """
+
+    def __init__(self, settings: DetectSettings) -> None:
+        import json
+
+        import httpx
+
+        self.settings = settings
+        self._json = json
+        self._client = httpx.Client(base_url=settings.ml_url.rstrip("/"), timeout=300.0)
+        self._faces_entry = {
+            "detection": {
+                "modelName": settings.model,
+                "options": {"minScore": settings.min_score},
+            },
+            "recognition": {"modelName": settings.model},
+        }
+
+    def close(self) -> None:
+        self._client.close()
+
+    def faces(
+        self, frame: np.ndarray
+    ) -> list[tuple[tuple[float, float, float, float], float, np.ndarray]]:
+        return self.predict(frame)[0]
+
+    def predict(
+        self, frame: np.ndarray, clip_model: str | None = None
+    ) -> tuple[list[tuple[tuple[float, float, float, float], float, np.ndarray]], np.ndarray | None]:
+        import cv2
+
+        from .immich_db import normalise, parse_vector
+
+        entries: dict = {"facial-recognition": self._faces_entry}
+        if clip_model:
+            entries["clip"] = {"visual": {"modelName": clip_model}}
+        ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if not ok:
+            raise RuntimeError("Could not encode frame as JPEG")
+        response = self._client.post(
+            "/predict",
+            data={"entries": self._json.dumps(entries)},
+            files={"image": ("frame.jpg", jpeg.tobytes(), "image/jpeg")},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        clip_vector = None
+        if clip_model and payload.get("clip") is not None:
+            # Stored as Immich stores smart search vectors: as returned (unit length).
+            clip_vector = parse_vector(payload["clip"])
+        results = []
+        for face in payload.get("facial-recognition") or []:
+            b = face["boundingBox"]
+            box = (float(b["x1"]), float(b["y1"]), float(b["x2"]), float(b["y2"]))
+            # Immich stores raw ArcFace vectors; everything here works on unit vectors.
+            embedding = normalise(parse_vector(face["embedding"]))[0]
+            results.append((box, float(face["score"]), embedding))
+        return results, clip_vector
 
 
 def _active_provider(app) -> str:

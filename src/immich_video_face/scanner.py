@@ -33,6 +33,9 @@ class ScanResult:
     error: str | None = None
     # Best observation crop per cluster, kept only when reports are requested.
     crops: dict[int, np.ndarray] = field(default_factory=dict)
+    duration_s: float = 0.0
+    # (timestamp_s, CLIP embedding) for the frames sampled for object search.
+    frame_embeddings: list[tuple[float, np.ndarray]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -70,21 +73,98 @@ class Scanner:
 
         result.frame_width = batch.width
         result.frame_height = batch.height
+        result.duration_s = info.duration_s
+
+        # Object search: every `clip_every`-th sampled frame also gets a CLIP
+        # embedding. Not for a Live Photo's motion clip -- it is hidden, so search
+        # could never return it, and the still beside it has its own embedding.
+        clip_every = 0
+        if self.detector.clip_model and not asset.still_asset_id:
+            fps = max(self.config.sampling.min_fps, 0.1)
+            clip_every = max(1, round(self.config.objects.interval_s * fps))
 
         observations: list[Observation] = []
+        clip_vectors: list[tuple[int, np.ndarray]] = []
+
+        def collect(index: int, outcome) -> None:
+            found, clip_vector = outcome
+            observations.extend(found)
+            if clip_vector is not None:
+                clip_vectors.append((index, clip_vector))
+
+        def wants_clip(index: int) -> bool:
+            return bool(clip_every) and index % clip_every == 0
+
+        workers = (
+            max(1, self.config.detect.ml_workers)
+            if self.config.detect.backend == "immich-ml"
+            else 1
+        )
         try:
-            for index, frame in frames_iter:
-                result.frames += 1
-                observations.extend(
-                    self.detector.detect(frame, frame_index=index, keep_crop=keep_crops)
-                )
+            if workers == 1:
+                for index, frame in frames_iter:
+                    result.frames += 1
+                    collect(
+                        index,
+                        self.detector.analyse(frame, index, keep_crops, wants_clip(index)),
+                    )
+            else:
+                # Keep several frames in flight so the ML service can work on them
+                # in parallel; results are collected in frame order. Each frame is
+                # its own buffer (ffmpeg output is read into fresh bytes), so it is
+                # safe to hand to another thread.
+                from collections import deque
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    inflight: deque = deque()
+                    for index, frame in frames_iter:
+                        result.frames += 1
+                        inflight.append(
+                            (
+                                index,
+                                pool.submit(
+                                    self.detector.analyse,
+                                    frame,
+                                    index,
+                                    keep_crops,
+                                    wants_clip(index),
+                                ),
+                            )
+                        )
+                        if len(inflight) >= workers * 2:
+                            done_index, future = inflight.popleft()
+                            collect(done_index, future.result())
+                    while inflight:
+                        done_index, future = inflight.popleft()
+                        collect(done_index, future.result())
         except Exception as exc:  # pragma: no cover - decode failures vary widely
             result.error = f"decode/detect failed: {exc}"
             return result
 
         result.observations = len(observations)
         result.clusters = cluster_observations(observations, self.config.cluster)
+
+        # Frame timestamps are complete now that ffmpeg has exited.
+        pad_s = 0.5 / max(self.config.sampling.min_fps, 0.1)
+        for cluster in result.clusters:
+            cluster.segments = cluster.time_segments(
+                batch, gap_s=self.config.timeline.gap_s, pad_s=pad_s
+            )
+        result.frame_embeddings = [
+            (batch.timestamp_for(index), vector)
+            for index, vector in clip_vectors
+            if not np.isnan(batch.timestamp_for(index))
+        ]
+
         result.matches = self.matcher.match_all(result.clusters)
+        # A person split over several clusters has their screen time merged; close
+        # the small gaps that leaves where one cluster hands over to the next.
+        from .cluster import merge_segments
+
+        bridge = max(0.0, self.config.timeline.gap_s - 2 * pad_s)
+        for match in result.matches:
+            match.segments = merge_segments(match.segments, gap_s=bridge)
 
         if keep_crops:
             result.crops = {
