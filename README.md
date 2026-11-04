@@ -48,7 +48,8 @@ Immich already runs (`POST /predict`, the same request Immich's server makes for
 - **No GPU stack and no second copy of the models**, which matters on a small server.
 - **`detect.ml_workers`** frames are kept in flight; the service runs them in parallel.
   On an 8-core VM without a GPU, 6 workers scanned phone video at 2 fps at about 3× real time,
-  with faces and CLIP in the same request.
+  with faces and CLIP in the same request; the CPU default of one frame every 2 s is about 4×
+  faster again.
 
 ### Appearance times and object search: the video index
 
@@ -78,8 +79,8 @@ Stock Immich ignores the `ivf` schema. A build with the companion patch reads it
   Something on screen for less than the sampling interval can be missed; lower
   `objects.interval_s` to trade scan time for coverage.
 
-The patch will be published in this repository under `immich-patch/`. Nothing else here
-needs it.
+The patch is in [`immich-patch/`](immich-patch/), one directory per Immich release it was
+made for. Nothing else here needs it.
 
 ### Running without Docker
 
@@ -392,6 +393,13 @@ Immich's own recognition threshold is 0.5, which is the right neighbourhood.
 **Symptom to watch for:** a cluster count close to the detection count.
 
 ### `sampling.min_fps` — decides whether brief appearances survive
+
+> **This fork:** `min_fps = "auto"` (the default) samples at `gpu_fps` (8) when detection runs
+> on a GPU and at `cpu_fps` (0.5, one frame every 2 s) when it does not. On a GPU decoding
+> dominates, so 8 fps is nearly free; on CPU every frame is a full detection pass, and 8 fps
+> would take about 16× longer than 0.5. `cluster.min_observations` and `timeline.gap_s` follow
+> the chosen rate when left at `"auto"` (1 sighting and 5 s at 0.5 fps; 3 and 3 s at 8 fps).
+> `detect.gpu` overrides the GPU guess, and `ivf check` shows what was chosen.
 
 A person on screen for three seconds yields three observations at 1 fps, and if clustering
 splits them at all, `min_observations` discards the lot. On a wedding clip, a man whose

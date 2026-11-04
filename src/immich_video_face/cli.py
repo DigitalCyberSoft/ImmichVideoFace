@@ -158,6 +158,13 @@ def check(config: Optional[Path] = _config_option, verbose: bool = False) -> Non
             f"schema {cfg.index.schema_name}: {stats.videos} videos, "
             f"{stats.frames} frames, {stats.appearances} appearances",
         )
+    device = {True: "GPU", False: "CPU", None: "set explicitly"}[cfg.gpu_resolved]
+    table.add_row(
+        "Sampling",
+        f"{cfg.sampling.min_fps:g} fps for faces ({device}); "
+        f"min {cfg.cluster.min_observations} sighting(s); new appearance after {cfg.timeline.gap_s:g} s"
+        + (f"; objects every {cfg.objects.interval_s:g} s" if cfg.objects.enabled else ""),
+    )
     table.add_row("Library root", cfg.paths.data_root_host)
     table.add_row("Config fingerprint", cfg.fingerprint)
     console.print(table)

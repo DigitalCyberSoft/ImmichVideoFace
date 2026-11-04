@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tomllib
 from functools import cached_property
@@ -121,9 +122,12 @@ class SamplingSettings(BaseModel):
     keyframes: bool = True
     # Brief appearances are the ones that get lost: at 1 fps a three-second
     # appearance yields three observations, which `min_observations` discards if
-    # clustering splits them at all. Decode dominates runtime rather than frame
-    # count, so raising this is cheaper than it looks.
-    min_fps: float = 8.0
+    # clustering splits them at all. On a GPU decode dominates runtime rather than
+    # frame count, so a high rate is cheap there. On CPU every frame costs a full
+    # detection pass, so "auto" picks `gpu_fps` or `cpu_fps` by what detection runs on.
+    min_fps: float | Literal["auto"] = "auto"
+    gpu_fps: float = 8.0
+    cpu_fps: float = 0.5
     max_long_edge: int = 960
     # Safety valve for the handful of very long videos in the library.
     max_frames: int = 3000
@@ -136,6 +140,11 @@ class DetectSettings(BaseModel):
     #                 then come from the exact code Immich uses for photos, no second
     #                 copy of the models is loaded, and no GPU stack is needed.
     backend: Literal["insightface", "immich-ml"] = "insightface"
+    # Whether detection runs on a GPU; drives the "auto" sampling settings.
+    # "auto": the insightface backend asks onnxruntime for CUDA; for immich-ml the
+    # service picks its own device, so a GPU is assumed only when this host has an
+    # NVIDIA one (nvidia-smi). Set true/false when that guess is wrong.
+    gpu: bool | Literal["auto"] = "auto"
     # immich-ml only: the service URL, and how many frames to have in flight.
     # The service runs requests in parallel, so a few workers keep every core busy.
     ml_url: str = "http://127.0.0.1:3003"
@@ -174,7 +183,8 @@ class TimelineSettings(BaseModel):
     # Someone absent from the sampled frames for longer than this starts a new
     # appearance. A little over the sampling interval bridges a missed detection
     # (a turned head, motion blur) without merging separate appearances.
-    gap_s: float = 3.0
+    # "auto": 3 s, or 2.5 sampling intervals when that is longer.
+    gap_s: float | Literal["auto"] = "auto"
 
 
 class IndexSettings(BaseModel):
@@ -197,7 +207,9 @@ class ClusterSettings(BaseModel):
     # discarded, losing people who were plainly visible. Immich's own
     # recognition threshold is 0.5, so this sits deliberately near it.
     distance: float = 0.55
-    min_observations: int = 3
+    # "auto": 3 at 2 fps or more, 2 at 1 fps, 1 below that -- at one frame every two
+    # seconds a single sighting can be a whole appearance.
+    min_observations: int | Literal["auto"] = "auto"
 
 
 class MatchSettings(BaseModel):
@@ -246,6 +258,33 @@ class Config(BaseModel):
 
     state_db: Path = Path("ivf-state.sqlite3")
     report_dir: Path = Path("reports")
+    # Set by resolve_auto(): whether "auto" settings were sized for a GPU.
+    gpu_resolved: bool | None = None
+
+    def resolve_auto(self) -> "Config":
+        """Replace "auto" settings with concrete values, before anything uses them.
+
+        Done once at load, so the fingerprint covers the values actually used:
+        moving to or from a GPU changes the sampling and invalidates old scans.
+        """
+        autos = (
+            self.sampling.min_fps == "auto"
+            or self.cluster.min_observations == "auto"
+            or self.timeline.gap_s == "auto"
+        )
+        if not autos:
+            return self
+        if self.sampling.min_fps == "auto":
+            self.gpu_resolved = detect_gpu(self.detect)
+            self.sampling.min_fps = (
+                self.sampling.gpu_fps if self.gpu_resolved else self.sampling.cpu_fps
+            )
+        fps = float(self.sampling.min_fps)
+        if self.cluster.min_observations == "auto":
+            self.cluster.min_observations = 3 if fps >= 2 else 2 if fps >= 1 else 1
+        if self.timeline.gap_s == "auto":
+            self.timeline.gap_s = round(max(3.0, 2.5 / max(fps, 0.01)), 3)
+        return self
 
     @cached_property
     def fingerprint(self) -> str:
@@ -260,8 +299,13 @@ class Config(BaseModel):
             # it out let runs staged under the old behaviour pass the staleness
             # check while still pointing at hidden clips.
             "select": self.select.model_dump(),
-            "sampling": self.sampling.model_dump(),
-            "detect": self.detect.model_dump(),
+            # Effective values only: the gpu/cpu presets, the GPU guess and how the
+            # ML service is reached do not change results; the resolved rate does.
+            "sampling": self.sampling.model_dump(exclude={"gpu_fps", "cpu_fps"}),
+            "detect": self.detect.model_dump(
+                exclude={"ml_url", "ml_workers", "gpu"}
+                | ({"backend"} if self.detect.backend == "insightface" else set())
+            ),
             "cluster": self.cluster.model_dump(),
             "match": self.match.model_dump(),
         }
@@ -273,6 +317,31 @@ class Config(BaseModel):
             payload["timeline"] = self.timeline.model_dump()
         blob = json.dumps(payload, sort_keys=True).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def detect_gpu(detect: DetectSettings) -> bool:
+    """Best guess at whether face detection will run on a GPU (see DetectSettings.gpu)."""
+    if detect.gpu != "auto":
+        return bool(detect.gpu)
+    if detect.backend == "insightface":
+        if detect.device != "cuda":
+            return False
+        try:
+            from .faces import preload_cuda_libraries
+
+            preload_cuda_libraries()
+            import onnxruntime
+
+            return "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+        except Exception:
+            return False
+    nvidia = shutil.which("nvidia-smi")
+    if not nvidia:
+        return False
+    try:
+        return subprocess.run([nvidia, "-L"], capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
 
 
 def _apply_env(data: dict) -> dict:
@@ -289,7 +358,7 @@ def load_config(path: Path | None = None) -> Config:
     for candidate in candidates:
         if candidate and candidate.exists():
             with candidate.open("rb") as handle:
-                return Config.model_validate(_apply_env(tomllib.load(handle)))
+                return Config.model_validate(_apply_env(tomllib.load(handle))).resolve_auto()
     if path:
         raise FileNotFoundError(f"Config file not found: {path}")
-    return Config.model_validate(_apply_env({}))
+    return Config.model_validate(_apply_env({})).resolve_auto()

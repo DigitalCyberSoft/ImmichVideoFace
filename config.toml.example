@@ -29,7 +29,12 @@ live_photos = "redirect"
 
 [sampling]
 keyframes = true
-min_fps = 8.0         # 1.0 loses people who are only on screen a few seconds
+# "auto" = gpu_fps when detection runs on a GPU, cpu_fps otherwise (see detect.gpu).
+# 1.0 can lose people who are only on screen a few seconds; on CPU each frame costs
+# a full detection pass, so the CPU preset trades that for a practical scan time.
+min_fps = "auto"
+gpu_fps = 8.0
+cpu_fps = 0.5         # one frame every 2 s
 max_long_edge = 960
 max_frames = 3000
 
@@ -37,6 +42,7 @@ max_frames = 3000
 # insightface - in-process InsightFace (GPU recommended)
 # immich-ml   - Immich's own ML service; no GPU stack, identical embeddings
 backend = "insightface"
+gpu = "auto"                       # true/false to override the GPU guess
 ml_url = "http://127.0.0.1:3003"   # immich-ml: the service Immich's server talks to
 ml_workers = 2                     # immich-ml: frames in flight; ~cores/1.5 on CPU
 # MUST match Immich's own model (Administration -> Settings -> Machine Learning
@@ -52,7 +58,7 @@ min_face_px = 40      # below this ArcFace is upscaling guesswork
 
 [cluster]
 distance = 0.55       # same face across a video easily exceeds 0.4; see README
-min_observations = 3  # kills single-frame false positives
+min_observations = "auto"  # 3 at >= 2 fps (kills single-frame false positives), 1 at 0.5 fps
 
 [match]
 max_distance = 0.4    # stricter than Immich's 0.5; video frames are blurrier
@@ -77,7 +83,7 @@ interval_s = 2.0
 model = "ViT-B-32__openai"   # MUST match Immich's smart search model
 
 [timeline]
-gap_s = 3.0                  # an absence longer than this starts a new appearance
+gap_s = "auto"               # an absence longer than this starts a new appearance (auto: max(3 s, 2.5 frames))
 
 [index]
 # Publish appearance times and frame embeddings to a schema this tool's DB role

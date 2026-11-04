@@ -1,0 +1,540 @@
+From 1a335c677c864327c45a9a726810554e2d86a6aa Mon Sep 17 00:00:00 2001
+From: DCS <claude@dcs.io>
+Date: Wed, 4 Nov 2026 02:20:53 -0800
+Subject: [PATCH 1/2] server: video index from immich-video-face
+
+GET /api/assets/:id/appearances returns who is on screen when in a video, and
+smart search also matches a video through CLIP embeddings of frames sampled
+across it. Both read the schema that immich-video-face publishes to (ivf, or
+IMMICH_VIDEO_INDEX_SCHEMA); without it they behave exactly as before.
+---
+ server/src/controllers/index.ts               |   2 +
+ .../src/controllers/video-index.controller.ts |  27 ++++
+ server/src/dtos/video-index.dto.ts            |  29 ++++
+ server/src/repositories/index.ts              |   2 +
+ server/src/repositories/search.repository.ts  |  38 ++++-
+ .../repositories/video-index.repository.ts    | 130 ++++++++++++++++++
+ server/src/services/index.ts                  |   2 +
+ server/src/services/search.service.spec.ts    |   1 +
+ server/src/services/search.service.ts         |   3 +-
+ .../src/services/video-index.service.spec.ts  |  90 ++++++++++++
+ server/src/services/video-index.service.ts    |  40 ++++++
+ 11 files changed, 361 insertions(+), 3 deletions(-)
+ create mode 100644 server/src/controllers/video-index.controller.ts
+ create mode 100644 server/src/dtos/video-index.dto.ts
+ create mode 100644 server/src/repositories/video-index.repository.ts
+ create mode 100644 server/src/services/video-index.service.spec.ts
+ create mode 100644 server/src/services/video-index.service.ts
+
+diff --git a/server/src/controllers/index.ts b/server/src/controllers/index.ts
+index 3cf594c..bed80fb 100644
+--- a/server/src/controllers/index.ts
++++ b/server/src/controllers/index.ts
+@@ -41,11 +41,13 @@ import { TimelineController } from 'src/controllers/timeline.controller.js';
+ import { TrashController } from 'src/controllers/trash.controller.js';
+ import { UserAdminController } from 'src/controllers/user-admin.controller.js';
+ import { UserController } from 'src/controllers/user.controller.js';
++import { VideoIndexController } from 'src/controllers/video-index.controller.js';
+ import { VideoStreamController } from 'src/controllers/video-stream.controller.js';
+ import { ViewController } from 'src/controllers/view.controller.js';
+ import { WorkflowController } from 'src/controllers/workflow.controller.js';
+ 
+ export const controllers = [
++  VideoIndexController,
+   ApiKeyController,
+   ActivityController,
+   AlbumController,
+diff --git a/server/src/controllers/video-index.controller.ts b/server/src/controllers/video-index.controller.ts
+new file mode 100644
+index 0000000..d41286e
+--- /dev/null
++++ b/server/src/controllers/video-index.controller.ts
+@@ -0,0 +1,27 @@
++import { Controller, Get, Param } from '@nestjs/common';
++import { ApiTags } from '@nestjs/swagger';
++import type { AuthDto } from 'src/dtos/auth.dto.js';
++import { Endpoint, HistoryBuilder } from 'src/decorators.js';
++import { VideoAppearancesResponseDto } from 'src/dtos/video-index.dto.js';
++import { ApiTag, Permission, RouteKey } from 'src/enum.js';
++import { Auth, Authenticated } from 'src/middleware/auth.guard.js';
++import { VideoIndexService } from 'src/services/video-index.service.js';
++import { UUIDParamDto } from 'src/validation.js';
++
++@ApiTags(ApiTag.Assets)
++@Controller(RouteKey.Asset)
++export class VideoIndexController {
++  constructor(private service: VideoIndexService) {}
++
++  @Get(':id/appearances')
++  @Authenticated({ permission: Permission.AssetRead })
++  @Endpoint({
++    summary: 'Retrieve who is on screen when in a video',
++    description:
++      'People recognised throughout a video and the intervals they are on screen, from the immich-video-face index. Empty when the video has not been indexed.',
++    history: new HistoryBuilder().added('v3.3.5'),
++  })
++  getAppearances(@Auth() auth: AuthDto, @Param() { id }: UUIDParamDto): Promise<VideoAppearancesResponseDto> {
++    return this.service.getAppearances(auth, id);
++  }
++}
+diff --git a/server/src/dtos/video-index.dto.ts b/server/src/dtos/video-index.dto.ts
+new file mode 100644
+index 0000000..1155339
+--- /dev/null
++++ b/server/src/dtos/video-index.dto.ts
+@@ -0,0 +1,29 @@
++import { createZodDto } from 'nestjs-zod';
++import z from 'zod';
++
++const VideoAppearanceSchema = z
++  .object({
++    person: z
++      .object({
++        id: z.string().describe('Person ID'),
++        name: z.string().describe('Person name'),
++        isHidden: z.boolean().describe('Whether the person is hidden'),
++        color: z.string().optional().describe('Person color'),
++        updatedAt: z.string().describe('Last update date'),
++      })
++      .describe('Person on screen'),
++    segments: z
++      .array(z.tuple([z.int(), z.int()]))
++      .describe('Intervals the person is on screen, as [startMs, endMs], sorted and non-overlapping'),
++  })
++  .meta({ id: 'VideoAppearanceDto' });
++
++const VideoAppearancesResponseSchema = z
++  .object({
++    durationMs: z.int().nullable().describe('Video duration in milliseconds, when known'),
++    appearances: z.array(VideoAppearanceSchema).describe('People on screen, most screen time first'),
++  })
++  .meta({ id: 'VideoAppearancesResponseDto' });
++
++export class VideoAppearancesResponseDto extends createZodDto(VideoAppearancesResponseSchema) {}
++export type VideoAppearanceDto = z.infer<typeof VideoAppearanceSchema>;
+diff --git a/server/src/repositories/index.ts b/server/src/repositories/index.ts
+index f2c6d1a..edd19c2 100644
+--- a/server/src/repositories/index.ts
++++ b/server/src/repositories/index.ts
+@@ -50,6 +50,7 @@ import { TelemetryRepository } from 'src/repositories/telemetry.repository.js';
+ import { TrashRepository } from 'src/repositories/trash.repository.js';
+ import { UserRepository } from 'src/repositories/user.repository.js';
+ import { VersionHistoryRepository } from 'src/repositories/version-history.repository.js';
++import { VideoIndexRepository } from 'src/repositories/video-index.repository.js';
+ import { VideoStreamRepository } from 'src/repositories/video-stream.repository.js';
+ import { ViewRepository } from 'src/repositories/view-repository.js';
+ import { WebsocketRepository } from 'src/repositories/websocket.repository.js';
+@@ -110,6 +111,7 @@ export const repositories = [
+   ViewRepository,
+   VersionHistoryRepository,
+   VideoStreamRepository,
++  VideoIndexRepository,
+   WebsocketRepository,
+   WorkflowRepository,
+ ];
+diff --git a/server/src/repositories/search.repository.ts b/server/src/repositories/search.repository.ts
+index a49c170..353eb5a 100644
+--- a/server/src/repositories/search.repository.ts
++++ b/server/src/repositories/search.repository.ts
+@@ -8,6 +8,7 @@ import { MapAsset } from 'src/dtos/asset-response.dto.js';
+ import { SearchFilter, SearchOrder } from 'src/dtos/search.dto.js';
+ import { AssetStatus, AssetType, AssetVisibility, VectorIndex } from 'src/enum.js';
+ import { probes } from 'src/repositories/database.repository.js';
++import { hasVideoFrames, nearestAssetsWithFrames } from 'src/repositories/video-index.repository.js';
+ import { DB } from 'src/schema/index.js';
+ import { AssetExifTable } from 'src/schema/tables/asset-exif.table.js';
+ import {
+@@ -161,7 +162,12 @@ export type SmartSearchOptions = SearchDateOptions &
+   SearchUserIdOptions &
+   SearchPeopleOptions &
+   SearchTagOptions &
+-  SearchOcrOptions & { visibility?: AssetVisibility | 'not-locked'; viewingUserId?: string };
++  SearchOcrOptions & {
++    visibility?: AssetVisibility | 'not-locked';
++    viewingUserId?: string;
++    /** CLIP model in use; enables matching on sampled video frames (immich-video-face). */
++    frameModel?: string;
++  };
+ 
+ export type LargeAssetSearchOptions = AssetSearchOptions & { minFileSize?: number };
+ 
+@@ -324,6 +330,20 @@ export class SearchRepository {
+ 
+     return this.db.transaction().execute(async (trx) => {
+       await sql`set local vchordrq.probes = ${sql.lit(probes[VectorIndex.Clip])}`.execute(trx);
++      // immich-video-face: a video also matches through frames sampled across it
++      if (options.frameModel && (await hasVideoFrames(trx))) {
++        const items = await searchAssetBuilderLegacy(trx, options)
++          .select(columns.searchAsset)
++          .innerJoin(nearestAssetsWithFrames(options.embedding, options.frameModel).as('nearest'), (join) =>
++            join.onRef('nearest.assetId', '=', 'asset.id'),
++          )
++          .orderBy(sql`nearest.distance`)
++          .orderBy('asset.id', 'asc')
++          .limit(pagination.size + 1)
++          .offset((pagination.page - 1) * pagination.size)
++          .execute();
++        return paginationHelper(items, pagination.size);
++      }
+       const items = await searchAssetBuilderLegacy(trx, options)
+         .select(columns.searchAsset)
+         .innerJoin('smart_search', 'asset.id', 'smart_search.assetId')
+@@ -568,11 +588,25 @@ export class SearchRepository {
+   @GenerateSql(...searchSmartV3Examples)
+   searchSmartV3(
+     pagination: PaginationOptions,
+-    options: Omit<AssetSearchBuilderV3Options, 'order'> & { embedding: string },
++    options: Omit<AssetSearchBuilderV3Options, 'order'> & { embedding: string; frameModel?: string },
+     scope: AssetSearchScope,
+   ) {
+     return this.db.transaction().execute(async (trx) => {
+       await sql`set local vchordrq.probes = ${sql.lit(probes[VectorIndex.Clip])}`.execute(trx);
++      // immich-video-face: a video also matches through frames sampled across it
++      if (options.frameModel && (await hasVideoFrames(trx))) {
++        const items = await searchAssetBuilder(trx, options, scope)
++          .select(columns.searchAsset)
++          .innerJoin(nearestAssetsWithFrames(options.embedding, options.frameModel).as('nearest'), (join) =>
++            join.onRef('nearest.assetId', '=', 'asset.id'),
++          )
++          .orderBy(sql`nearest.distance`)
++          .orderBy('asset.id', 'asc')
++          .limit(pagination.take + 1)
++          .offset(pagination.skip ?? 0)
++          .execute();
++        return paginationHelper(items, pagination.take);
++      }
+       const items = await searchAssetBuilder(trx, options, scope)
+         .select(columns.searchAsset)
+         .innerJoin('smart_search', 'asset.id', 'smart_search.assetId')
+diff --git a/server/src/repositories/video-index.repository.ts b/server/src/repositories/video-index.repository.ts
+new file mode 100644
+index 0000000..c70214f
+--- /dev/null
++++ b/server/src/repositories/video-index.repository.ts
+@@ -0,0 +1,130 @@
++import { Injectable } from '@nestjs/common';
++import { type Kysely, sql } from 'kysely';
++import { InjectKysely } from 'nestjs-kysely';
++import { DB } from 'src/schema/index.js';
++
++/**
++ * Read-only access to the video index published by immich-video-face
++ * (https://github.com/DigitalCyberSoft/ImmichVideoFace).
++ *
++ * The scanner keeps two things Immich has no place for, in a schema that its own
++ * database role owns (`ivf` unless IMMICH_VIDEO_INDEX_SCHEMA says otherwise):
++ *   - appearance:      when each person is on screen in a video
++ *   - frame_embedding: CLIP embeddings of frames sampled through each video
++ * Immich never writes there. Without the schema, everything here is a no-op.
++ */
++export const VIDEO_INDEX_SCHEMA = process.env.IMMICH_VIDEO_INDEX_SCHEMA || 'ivf';
++
++const RECHECK_MS = 60_000;
++let cache: { at: number; tables: Set<string> } | undefined;
++
++/** Which video-index tables exist, re-checked at most once a minute. */
++export const videoIndexTables = async (db: Kysely<DB>): Promise<Set<string>> => {
++  if (cache && Date.now() - cache.at < RECHECK_MS) {
++    return cache.tables;
++  }
++  const { rows } = await sql<{ name: string }>`
++    select table_name as name from information_schema.tables
++    where table_schema = ${VIDEO_INDEX_SCHEMA} and table_name in ('appearance', 'frame_embedding')
++  `.execute(db);
++  cache = { at: Date.now(), tables: new Set(rows.map((row) => row.name)) };
++  return cache.tables;
++};
++
++export const hasVideoFrames = async (db: Kysely<DB>): Promise<boolean> => {
++  const tables = await videoIndexTables(db);
++  return tables.has('frame_embedding');
++};
++
++/**
++ * Per asset, the smallest CLIP distance over its own embedding and every sampled frame
++ * of it. Frames are only compared when they were embedded with the model in use, so a
++ * model change can never mix vector spaces. Exhaustive rather than indexed: it scores
++ * every embedding, which is exact, and fast enough for a personal library.
++ */
++export const nearestAssetsWithFrames = (embedding: string, model: string) =>
++  sql<{ assetId: string; distance: number }>`(
++    select candidate."assetId", min(candidate.distance) as distance
++    from (
++      select smart_search."assetId", smart_search.embedding <=> ${embedding} as distance
++      from smart_search
++      union all
++      select frame.asset_id, frame.embedding <=> ${embedding}::vector
++      from ${sql.id(VIDEO_INDEX_SCHEMA, 'frame_embedding')} frame
++      where frame.model = ${model}
++    ) candidate
++    group by candidate."assetId"
++  )`;
++
++export type VideoAppearanceRow = {
++  durationMs: number | null;
++  personId: string;
++  name: string;
++  isHidden: boolean;
++  color: string | null;
++  updatedAt: Date;
++  segments: [number, number][];
++};
++
++@Injectable()
++export class VideoIndexRepository {
++  constructor(@InjectKysely() private db: Kysely<DB>) {}
++
++  async hasAppearances() {
++    const tables = await videoIndexTables(this.db);
++    return tables.has('appearance');
++  }
++
++  /**
++   * Who is on screen when, for one video. A row follows the face it was recorded with,
++   * so a merged or reassigned person is reported as whoever now owns that face; the
++   * person id saved at scan time is the fallback when the face is gone.
++   */
++  async getAppearances(assetId: string): Promise<VideoAppearanceRow[]> {
++    const { rows } = await sql<VideoAppearanceRow>`
++      select
++        asset.duration as "durationMs",
++        person."personGroupId" as "personId",
++        person.name,
++        person."isHidden",
++        person.color,
++        person."updatedAt",
++        appearance.segments
++      from ${sql.id(VIDEO_INDEX_SCHEMA, 'appearance')} appearance
++      inner join asset on asset.id = appearance.asset_id and asset."deletedAt" is null
++      left join asset_face face
++        on face.id = appearance.face_id
++        and face."assetId" = appearance.asset_id
++        and face."deletedAt" is null
++      inner join person
++        on person."personGroupId" = coalesce(face."personGroupId", appearance.person_id)
++        and person."ownerId" = asset."ownerId"
++      where appearance.asset_id = ${assetId}
++    `.execute(this.db);
++
++    // Two rows can land on one person after a merge; their screen time is combined.
++    const byPerson = new Map<string, VideoAppearanceRow>();
++    for (const row of rows) {
++      const existing = byPerson.get(row.personId);
++      if (existing) {
++        existing.segments = mergeSegments([...existing.segments, ...row.segments]);
++      } else {
++        byPerson.set(row.personId, { ...row, segments: mergeSegments(row.segments) });
++      }
++    }
++    return byPerson.values().toArray();
++  }
++}
++
++export const mergeSegments = (segments: [number, number][]): [number, number][] => {
++  const merged: [number, number][] = [];
++  for (const [start, end] of [...segments].sort((a, b) => a[0] - b[0])) {
++    const last = merged.at(-1);
++    if (last && start <= last[1]) {
++      last[1] = Math.max(last[1], end);
++    } else {
++      merged.push([start, end]);
++    }
++  }
++  return merged;
++};
+diff --git a/server/src/services/index.ts b/server/src/services/index.ts
+index b8ad33b..b3e2ae1 100644
+--- a/server/src/services/index.ts
++++ b/server/src/services/index.ts
+@@ -48,11 +48,13 @@ import { TrashService } from 'src/services/trash.service.js';
+ import { UserAdminService } from 'src/services/user-admin.service.js';
+ import { UserService } from 'src/services/user.service.js';
+ import { VersionService } from 'src/services/version.service.js';
++import { VideoIndexService } from 'src/services/video-index.service.js';
+ import { ViewService } from 'src/services/view.service.js';
+ import { WorkflowExecutionService } from 'src/services/workflow-execution.service.js';
+ import { WorkflowService } from 'src/services/workflow.service.js';
+ 
+ export const services = [
++  VideoIndexService,
+   ApiKeyService,
+   ActivityService,
+   AlbumService,
+diff --git a/server/src/services/search.service.spec.ts b/server/src/services/search.service.spec.ts
+index 5fb88f8..09eedfd 100644
+--- a/server/src/services/search.service.spec.ts
++++ b/server/src/services/search.service.spec.ts
+@@ -334,6 +334,7 @@ describe(SearchService.name, () => {
+           query: 'test',
+           size: 100,
+           embedding: '[1, 2, 3]',
++          frameModel: 'ViT-B-32__openai',
+           userIds: [authStub.user1.user.id],
+           viewingUserId: authStub.user1.user.id,
+           visibility: 'not-locked',
+diff --git a/server/src/services/search.service.ts b/server/src/services/search.service.ts
+index 6c8f484..98574ec 100644
+--- a/server/src/services/search.service.ts
++++ b/server/src/services/search.service.ts
+@@ -190,6 +190,7 @@ export class SearchService extends BaseService {
+         userIds: await userIds,
+         viewingUserId: auth.user.id,
+         embedding,
++        frameModel: machineLearning.clip.modelName,
+         visibility: dto.visibility ?? (auth.session?.hasElevatedPermission ? undefined : 'not-locked'),
+       },
+     );
+@@ -292,7 +293,7 @@ export class SearchService extends BaseService {
+     // no cursor until a rank-aware pagination strategy for smart search is decided
+     const { items } = await this.searchRepository.searchSmartV3(
+       { take: dto.size },
+-      { filter, withExif: dto.withExif, embedding },
++      { filter, withExif: dto.withExif, embedding, frameModel: machineLearning.clip.modelName },
+       scope,
+     );
+ 
+diff --git a/server/src/services/video-index.service.spec.ts b/server/src/services/video-index.service.spec.ts
+new file mode 100644
+index 0000000..c43f3db
+--- /dev/null
++++ b/server/src/services/video-index.service.spec.ts
+@@ -0,0 +1,90 @@
++import { BadRequestException } from '@nestjs/common';
++import { describe, expect, it, vitest } from 'vitest';
++import { mergeSegments } from 'src/repositories/video-index.repository.js';
++import { VideoIndexService } from 'src/services/video-index.service.js';
++import { authStub } from 'test/fixtures/auth.stub.js';
++
++const assetId = '00000000-0000-4000-8000-000000000001';
++
++const setup = (allowed: boolean, hasAppearances = true, rows: unknown[] = []) => {
++  const none = () => vitest.fn().mockResolvedValue(new Set());
++  const access = {
++    asset: {
++      checkOwnerAccess: vitest.fn().mockResolvedValue(new Set(allowed ? [assetId] : [])),
++      checkAlbumAccess: none(),
++      checkPartnerAccess: none(),
++    },
++  };
++  const videoIndex = {
++    hasAppearances: vitest.fn().mockResolvedValue(hasAppearances),
++    getAppearances: vitest.fn().mockResolvedValue(rows),
++  };
++  return { sut: new VideoIndexService(access as any, videoIndex as any), videoIndex };
++};
++
++describe(VideoIndexService.name, () => {
++  it('requires access to the asset', async () => {
++    const { sut, videoIndex } = setup(false);
++    await expect(sut.getAppearances(authStub.user1, assetId)).rejects.toBeInstanceOf(BadRequestException);
++    expect(videoIndex.getAppearances).not.toHaveBeenCalled();
++  });
++
++  it('returns nothing when the video index is not installed', async () => {
++    const { sut, videoIndex } = setup(true, false);
++    await expect(sut.getAppearances(authStub.user1, assetId)).resolves.toEqual({ durationMs: null, appearances: [] });
++    expect(videoIndex.getAppearances).not.toHaveBeenCalled();
++  });
++
++  it('orders people by screen time', async () => {
++    const updatedAt = new Date('2026-11-04T00:00:00.000Z');
++    const { sut } = setup(true, true, [
++      {
++        durationMs: 9000,
++        personId: 'a',
++        name: 'Brief',
++        isHidden: false,
++        color: null,
++        updatedAt,
++        segments: [[0, 1000]],
++      },
++      {
++        durationMs: 9000,
++        personId: 'b',
++        name: 'Long',
++        isHidden: false,
++        color: '#ff0000',
++        updatedAt,
++        segments: [
++          [0, 4000],
++          [6000, 8000],
++        ],
++      },
++    ]);
++    const { durationMs, appearances } = await sut.getAppearances(authStub.user1, assetId);
++    expect(durationMs).toBe(9000);
++    expect(appearances.map((a) => a.person.name)).toEqual(['Long', 'Brief']);
++    expect(appearances[0]).toEqual({
++      person: { id: 'b', name: 'Long', isHidden: false, color: '#ff0000', updatedAt: updatedAt.toISOString() },
++      segments: [
++        [0, 4000],
++        [6000, 8000],
++      ],
++    });
++    expect(appearances[1].person.color).toBeUndefined();
++  });
++});
++
++describe('mergeSegments', () => {
++  it('sorts and unions overlapping intervals', () => {
++    expect(
++      mergeSegments([
++        [5000, 6000],
++        [0, 2000],
++        [1500, 3000],
++      ]),
++    ).toEqual([
++      [0, 3000],
++      [5000, 6000],
++    ]);
++  });
++});
+diff --git a/server/src/services/video-index.service.ts b/server/src/services/video-index.service.ts
+new file mode 100644
+index 0000000..59334ef
+--- /dev/null
++++ b/server/src/services/video-index.service.ts
+@@ -0,0 +1,40 @@
++import { Injectable } from '@nestjs/common';
++import { AuthDto } from 'src/dtos/auth.dto.js';
++import { VideoAppearanceDto, VideoAppearancesResponseDto } from 'src/dtos/video-index.dto.js';
++import { Permission } from 'src/enum.js';
++import { AccessRepository } from 'src/repositories/access.repository.js';
++import { VideoIndexRepository } from 'src/repositories/video-index.repository.js';
++import { requireAccess } from 'src/utils/access.js';
++
++const screenTime = (segments: [number, number][]) => segments.reduce((sum, [start, end]) => sum + end - start, 0);
++
++/** Who is on screen when in a video, from the immich-video-face index. */
++@Injectable()
++export class VideoIndexService {
++  constructor(
++    private accessRepository: AccessRepository,
++    private videoIndexRepository: VideoIndexRepository,
++  ) {}
++
++  async getAppearances(auth: AuthDto, id: string): Promise<VideoAppearancesResponseDto> {
++    await requireAccess(this.accessRepository, { auth, permission: Permission.AssetRead, ids: [id] });
++    if (!(await this.videoIndexRepository.hasAppearances())) {
++      return { durationMs: null, appearances: [] };
++    }
++
++    const rows = await this.videoIndexRepository.getAppearances(id);
++    const appearances: VideoAppearanceDto[] = rows
++      .map((row) => ({
++        person: {
++          id: row.personId,
++          name: row.name,
++          isHidden: row.isHidden,
++          color: row.color ?? undefined,
++          updatedAt: new Date(row.updatedAt).toISOString(),
++        },
++        segments: row.segments,
++      }))
++      .sort((a, b) => screenTime(b.segments) - screenTime(a.segments));
++    return { durationMs: rows[0]?.durationMs ?? null, appearances };
++  }
++}
+-- 
+2.56.0
+
