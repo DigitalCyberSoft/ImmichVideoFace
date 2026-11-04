@@ -413,8 +413,10 @@ splits them at all, `min_observations` discards the lot. On a wedding clip, a ma
 individual frames matched at 0.35 vanished entirely at 1 fps and appeared correctly at 2 fps.
 
 Raising this doesn't loosen any threshold — it gives short appearances enough evidence to clear
-the bar. **It is also much cheaper than it looks**: decode dominates runtime, not frame count.
-Measured on one library, 8 fps cost only ~11% more wall time than 1 fps.
+the bar. **With a GPU it is also much cheaper than it looks**: decode dominates runtime, not frame
+count. Measured upstream on one library with a GPU, 8 fps cost only ~11% more wall time than 1 fps.
+Without a GPU this does not hold: each frame is a full model pass, and time grows with frame count
+(see the note above).
 
 ### `detect.min_face_px` — tiny faces are actively harmful
 
