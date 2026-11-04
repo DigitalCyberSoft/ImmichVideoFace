@@ -290,6 +290,9 @@ def scan(
     ),
     report: bool = typer.Option(True, "--report/--no-report", help="Emit an HTML report"),
     force: bool = typer.Option(False, "--force", help="Re-scan assets already done"),
+    retry_failed: bool = typer.Option(
+        False, "--retry-failed", help="Also retry videos that failed to scan before"
+    ),
     verbose: bool = False,
 ) -> None:
     """Scan videos and stage the results for review.
@@ -339,7 +342,11 @@ def scan(
                     f"[yellow]Discarded the previous uncommitted batch[/yellow] "
                     f"({dropped} staged faces, {returned} videos back in the queue)"
                 )
-            done = set() if force else state.already_scanned(cfg.fingerprint)
+            done = (
+                set()
+                if force
+                else state.already_scanned(cfg.fingerprint, include_failed=not retry_failed)
+            )
             assets = []
             for candidate in db.list_videos(owner, newest_first=newest):
                 if candidate.id in done:
@@ -874,6 +881,7 @@ def status(config: Optional[Path] = _config_option) -> None:
     cfg = _setup(config)
     with State(cfg.state_db) as state:
         summary = state.summary()
+        failed = state.failed_assets()
         awaiting = state.runs_awaiting_review()
         stale = {
             run_id: state.run_fingerprint(run_id)
@@ -886,6 +894,11 @@ def status(config: Optional[Path] = _config_option) -> None:
         table.add_row(key.replace("_", " "), str(value))
     table.add_row("fingerprint", cfg.fingerprint)
     console.print(table)
+    if failed:
+        console.print(f"[yellow]{len(failed)} video(s) failed to scan[/yellow] and are skipped:")
+        for asset_id, error in failed[:10]:
+            console.print(f"  {asset_id}: {error[:120]}")
+        console.print("Retry them with [bold]ivf scan --retry-failed[/bold].")
 
     if awaiting:
         pending = Table(title="Awaiting review")

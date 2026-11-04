@@ -301,19 +301,33 @@ class State:
 
     # ---- scan bookkeeping ----------------------------------------------
 
-    def already_scanned(self, fingerprint: str) -> set[str]:
+    def already_scanned(self, fingerprint: str, include_failed: bool = True) -> set[str]:
         """Assets that are genuinely done: scanned under the current settings
         *and* settled.
 
         A changed threshold changes the fingerprint, which correctly makes
         previously-scanned assets eligible again.
+
+        Assets that failed under the current settings count as done unless
+        `include_failed` is false. Otherwise an unreadable file (a truncated
+        clip, say) is picked again by every batch, crowding out new videos, and
+        a batched backfill never reaches the end. `ivf scan --retry-failed`
+        gives them another try.
         """
+        status = "status IN ('ok', 'error')" if include_failed else "status='ok'"
         rows = self._conn.execute(
             "SELECT asset_id FROM scanned_assets "
-            "WHERE fingerprint=? AND status='ok' AND settled=1",
+            f"WHERE fingerprint=? AND settled=1 AND {status}",
             (fingerprint,),
         ).fetchall()
         return {row["asset_id"] for row in rows}
+
+    def failed_assets(self) -> list[tuple[str, str]]:
+        rows = self._conn.execute(
+            "SELECT asset_id, coalesce(error, '') AS error FROM scanned_assets "
+            "WHERE status<>'ok' ORDER BY asset_id"
+        ).fetchall()
+        return [(row["asset_id"], row["error"]) for row in rows]
 
     def discard_unsettled(self) -> tuple[int, int]:
         """Throw away any batch that was scanned but never committed.
