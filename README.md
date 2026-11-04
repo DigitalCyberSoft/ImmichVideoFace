@@ -3,7 +3,8 @@
 > **This is a fork** of [CarlitoGrey/ImmichVideoFace](https://github.com/CarlitoGrey/ImmichVideoFace).
 > It adds Immich 3.3+ support, CPU-only operation through Immich's own machine-learning
 > service, installs without Docker, **when-is-who-on-screen** appearance times, and **object
-> search across every frame**. See [What this fork adds](#what-this-fork-adds).
+> search over the whole video** (a sampled frame every 2 s by default, not only the thumbnail).
+> See [What this fork adds](#what-this-fork-adds).
 
 **Immich only looks for faces in a video's thumbnail.** If someone appears at 04:12 but not in
 the frame Immich picked for the thumbnail, that video never shows up on their people page.
@@ -34,7 +35,7 @@ No Immich fork, no patched container, nothing added to the Immich stack.
 | Immich versions | 2.x – 3.2 (`asset_face.personId`) | also **3.3+**, where faces point at person groups (`personGroupId`); detected automatically |
 | Where faces are detected | InsightFace in-process, GPU strongly recommended | either that, or **`detect.backend = "immich-ml"`**: frames go to Immich's own ML service |
 | Installs | Docker (`docker:` DB host, `/data` paths) | also native installs: Unix-socket Postgres, peer auth, host paths |
-| Output | a face per person per video | also **appearance times** (who is on screen when) and **per-frame CLIP embeddings** |
+| Output | a face per person per video | also **appearance times** (who is on screen when) and **CLIP embeddings of sampled frames** (every `objects.interval_s`, 2 s by default) |
 
 ### Immich's ML service as the detector
 
@@ -73,7 +74,9 @@ database role owns. Immich's tables are still never written directly.
 Stock Immich ignores the `ivf` schema. A build with the companion patch reads it:
 
 - **The video viewer** shows a timeline with a row per person, marking when they are on screen.
-- **Smart search** ranks a video by its best-matching frame, not just its thumbnail.
+- **Smart search** ranks a video by its best-matching sampled frame, not just its thumbnail.
+  Something on screen for less than the sampling interval can be missed; lower
+  `objects.interval_s` to trade scan time for coverage.
 
 The patch will be published in this repository under `immich-patch/`. Nothing else here
 needs it.
