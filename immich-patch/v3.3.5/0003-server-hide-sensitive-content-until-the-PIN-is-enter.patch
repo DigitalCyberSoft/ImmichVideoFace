@@ -1,0 +1,849 @@
+From b42bc6d8470b139eedbdb1e9ba2eaab419050ccf Mon Sep 17 00:00:00 2001
+From: DCS <claude@dcs.io>
+Date: Thu, 5 Nov 2026 00:43:26 -0800
+Subject: [PATCH 3/5] server: hide sensitive content until the PIN is entered
+
+An asset tagged IMMICH_SENSITIVE_TAG (default Sensitive) or a tag under it,
+or showing a person marked sensitive, keeps its place in the timeline,
+search and albums, but its thumbnails and image originals are served as a
+blurred placeholder (its thumbhash, enlarged and marked) and its video and
+video original are refused, until the session is unlocked with the PIN.
+A Live Photo's motion part follows its still. Shared links always get the
+placeholder. Real media of sensitive assets is sent uncached.
+
+GET /api/assets/:id/sensitive says whether an asset is hidden.
+GET/PUT /api/people/:id/sensitive marks a person sensitive; showing them
+again needs an unlocked session. People are kept in the video index schema
+(sensitive_person), so this part needs immich-video-face's schema.
+---
+ server/src/controllers/index.spec.ts          |   1 +
+ server/src/controllers/index.ts               |   3 +
+ .../src/controllers/sensitive.controller.ts   |  64 +++++++++++
+ server/src/dtos/sensitive.dto.ts              |  28 +++++
+ server/src/repositories/person.repository.ts  |  32 ++++++
+ server/src/repositories/tag.repository.ts     |  37 +++++++
+ .../repositories/video-index.repository.ts    |   4 +-
+ .../src/services/asset-media.service.spec.ts  |  72 +++++++++++++
+ server/src/services/asset-media.service.ts    |  29 ++++-
+ server/src/services/hls.service.ts            |   5 +
+ server/src/services/index.ts                  |   2 +
+ server/src/services/person.service.ts         |   5 +
+ server/src/services/sensitive.service.spec.ts |  86 +++++++++++++++
+ server/src/services/sensitive.service.ts      |  54 ++++++++++
+ server/src/utils/sensitive.spec.ts            |  25 +++++
+ server/src/utils/sensitive.ts                 | 102 ++++++++++++++++++
+ 16 files changed, 545 insertions(+), 4 deletions(-)
+ create mode 100644 server/src/controllers/sensitive.controller.ts
+ create mode 100644 server/src/dtos/sensitive.dto.ts
+ create mode 100644 server/src/services/sensitive.service.spec.ts
+ create mode 100644 server/src/services/sensitive.service.ts
+ create mode 100644 server/src/utils/sensitive.spec.ts
+ create mode 100644 server/src/utils/sensitive.ts
+
+diff --git a/server/src/controllers/index.spec.ts b/server/src/controllers/index.spec.ts
+index e156e01..a418a1f 100644
+--- a/server/src/controllers/index.spec.ts
++++ b/server/src/controllers/index.spec.ts
+@@ -50,6 +50,7 @@ const SHARED_LINK_ROUTES = new Set([
+   'GET albums/:id/map-markers',
+   'GET assets/:id',
+   'GET assets/:id/original',
++  'GET assets/:id/sensitive',
+   'GET assets/:id/thumbnail',
+   'GET assets/:id/video/playback',
+   'GET assets/:id/video/stream/:sessionId/:variantIndex/:filename',
+diff --git a/server/src/controllers/index.ts b/server/src/controllers/index.ts
+index bed80fb..4f4ee0a 100644
+--- a/server/src/controllers/index.ts
++++ b/server/src/controllers/index.ts
+@@ -29,6 +29,7 @@ import { PersonController } from 'src/controllers/person.controller.js';
+ import { PluginController } from 'src/controllers/plugin.controller.js';
+ import { QueueController } from 'src/controllers/queue.controller.js';
+ import { SearchController } from 'src/controllers/search.controller.js';
++import { SensitiveController, SensitivePersonController } from 'src/controllers/sensitive.controller.js';
+ import { ServerController } from 'src/controllers/server.controller.js';
+ import { SessionController } from 'src/controllers/session.controller.js';
+ import { SharedLinkController } from 'src/controllers/shared-link.controller.js';
+@@ -48,6 +49,8 @@ import { WorkflowController } from 'src/controllers/workflow.controller.js';
+ 
+ export const controllers = [
+   VideoIndexController,
++  SensitiveController,
++  SensitivePersonController,
+   ApiKeyController,
+   ActivityController,
+   AlbumController,
+diff --git a/server/src/controllers/sensitive.controller.ts b/server/src/controllers/sensitive.controller.ts
+new file mode 100644
+index 0000000..078ff84
+--- /dev/null
++++ b/server/src/controllers/sensitive.controller.ts
+@@ -0,0 +1,64 @@
++import { Body, Controller, Get, Param, Put } from '@nestjs/common';
++import { ApiTags } from '@nestjs/swagger';
++import type { AuthDto } from 'src/dtos/auth.dto.js';
++import { Endpoint, HistoryBuilder } from 'src/decorators.js';
++import {
++  AssetSensitiveResponseDto,
++  PersonSensitiveResponseDto,
++  PersonSensitiveUpdateDto,
++} from 'src/dtos/sensitive.dto.js';
++import { ApiTag, Permission, RouteKey } from 'src/enum.js';
++import { Auth, Authenticated } from 'src/middleware/auth.guard.js';
++import { SensitiveService } from 'src/services/sensitive.service.js';
++import { UUIDParamDto } from 'src/validation.js';
++
++@ApiTags(ApiTag.Assets)
++@Controller(RouteKey.Asset)
++export class SensitiveController {
++  constructor(private service: SensitiveService) {}
++
++  @Get(':id/sensitive')
++  @Authenticated({ permission: Permission.AssetRead, sharedLink: true })
++  @Endpoint({
++    summary: 'Retrieve whether an asset is sensitive',
++    description:
++      'Whether the asset carries the sensitive tag (IMMICH_SENSITIVE_TAG, or a tag under it) or shows a person marked sensitive, and whether its media is withheld until the session is unlocked with the PIN.',
++    history: new HistoryBuilder().added('v3.3.5'),
++  })
++  getSensitive(@Auth() auth: AuthDto, @Param() { id }: UUIDParamDto): Promise<AssetSensitiveResponseDto> {
++    return this.service.getAsset(auth, id);
++  }
++}
++
++@ApiTags(ApiTag.People)
++@Controller('people')
++export class SensitivePersonController {
++  constructor(private service: SensitiveService) {}
++
++  @Get(':id/sensitive')
++  @Authenticated({ permission: Permission.PersonRead })
++  @Endpoint({
++    summary: 'Retrieve whether a person is sensitive',
++    description: 'Whether every asset showing this person is hidden until the session is unlocked with the PIN.',
++    history: new HistoryBuilder().added('v3.3.5'),
++  })
++  getSensitive(@Auth() auth: AuthDto, @Param() { id }: UUIDParamDto): Promise<PersonSensitiveResponseDto> {
++    return this.service.getPerson(auth, id);
++  }
++
++  @Put(':id/sensitive')
++  @Authenticated({ permission: Permission.PersonUpdate })
++  @Endpoint({
++    summary: 'Mark a person sensitive',
++    description:
++      'Hide every asset showing this person until the session is unlocked with the PIN. Showing them again requires an unlocked session.',
++    history: new HistoryBuilder().added('v3.3.5'),
++  })
++  updateSensitive(
++    @Auth() auth: AuthDto,
++    @Param() { id }: UUIDParamDto,
++    @Body() dto: PersonSensitiveUpdateDto,
++  ): Promise<PersonSensitiveResponseDto> {
++    return this.service.updatePerson(auth, id, dto);
++  }
++}
+diff --git a/server/src/dtos/sensitive.dto.ts b/server/src/dtos/sensitive.dto.ts
+new file mode 100644
+index 0000000..1e6bdef
+--- /dev/null
++++ b/server/src/dtos/sensitive.dto.ts
+@@ -0,0 +1,28 @@
++import { createZodDto } from 'nestjs-zod';
++import z from 'zod';
++
++const AssetSensitiveResponseSchema = z
++  .object({
++    sensitive: z.boolean().describe('Whether the asset carries the sensitive tag, or shows a person marked sensitive'),
++    hidden: z.boolean().describe('Whether its media is withheld until the session is unlocked with the PIN'),
++    tag: z.string().describe('The sensitive tag (IMMICH_SENSITIVE_TAG); empty when tags are not used'),
++  })
++  .meta({ id: 'AssetSensitiveResponseDto' });
++
++const PersonSensitiveResponseSchema = z
++  .object({
++    sensitive: z.boolean().describe('Whether every asset showing this person is hidden until the PIN is entered'),
++    hidden: z.boolean().describe('Whether that applies to this session now (it is not unlocked)'),
++    available: z.boolean().describe('Whether people can be marked sensitive on this server'),
++  })
++  .meta({ id: 'PersonSensitiveResponseDto' });
++
++const PersonSensitiveUpdateSchema = z
++  .object({
++    sensitive: z.boolean().describe('Hide every asset showing this person until the PIN is entered'),
++  })
++  .meta({ id: 'PersonSensitiveUpdateDto' });
++
++export class AssetSensitiveResponseDto extends createZodDto(AssetSensitiveResponseSchema) {}
++export class PersonSensitiveResponseDto extends createZodDto(PersonSensitiveResponseSchema) {}
++export class PersonSensitiveUpdateDto extends createZodDto(PersonSensitiveUpdateSchema) {}
+diff --git a/server/src/repositories/person.repository.ts b/server/src/repositories/person.repository.ts
+index 5863812..de1c90c 100644
+--- a/server/src/repositories/person.repository.ts
++++ b/server/src/repositories/person.repository.ts
+@@ -15,6 +15,7 @@ import { Chunked, ChunkedArray, DummyValue, GenerateSql } from 'src/decorators.j
+ import { PersonUserRole } from 'src/dtos/person.dto.js';
+ import { AssetFileType, AssetVisibility, SourceType, UserMetadataKey } from 'src/enum.js';
+ import { type YearMonthDay } from 'src/repositories/asset.repository.js';
++import { VIDEO_INDEX_SCHEMA, videoIndexTables } from 'src/repositories/video-index.repository.js';
+ import { DB } from 'src/schema/index.js';
+ import { AssetFaceTable } from 'src/schema/tables/asset-face.table.js';
+ import { FaceSearchTable } from 'src/schema/tables/face-search.table.js';
+@@ -1006,4 +1007,35 @@ export class PersonRepository {
+       .where('person.personGroupId', 'in', personGroupIds)
+       .execute();
+   }
++
++  /** Whether people can be marked sensitive: the video index has the table for it. */
++  async sensitiveAvailable(): Promise<boolean> {
++    const tables = await videoIndexTables(this.db);
++    return tables.has('sensitive_person');
++  }
++
++  /** Whether this person is marked sensitive (see VideoIndexRepository). */
++  async isSensitive(personGroupId: string): Promise<boolean> {
++    if (!(await this.sensitiveAvailable())) {
++      return false;
++    }
++    const { rows } = await sql<{ one: number }>`
++      select 1 as one from ${sql.id(VIDEO_INDEX_SCHEMA, 'sensitive_person')} where person_group_id = ${personGroupId}::uuid
++    `.execute(this.db);
++    return rows.length > 0;
++  }
++
++  /** Mark or unmark a person sensitive. False when the table is missing. */
++  async setSensitive(ownerId: string, personGroupId: string, sensitive: boolean): Promise<boolean> {
++    if (!(await this.sensitiveAvailable())) {
++      return false;
++    }
++    const table = sql.id(VIDEO_INDEX_SCHEMA, 'sensitive_person');
++    await (
++      sensitive
++        ? sql`insert into ${table} (owner_id, person_group_id) values (${ownerId}::uuid, ${personGroupId}::uuid) on conflict do nothing`
++        : sql`delete from ${table} where person_group_id = ${personGroupId}::uuid`
++    ).execute(this.db);
++    return true;
++  }
+ }
+diff --git a/server/src/repositories/tag.repository.ts b/server/src/repositories/tag.repository.ts
+index 2dc1030..6b9dc89 100644
+--- a/server/src/repositories/tag.repository.ts
++++ b/server/src/repositories/tag.repository.ts
+@@ -1,9 +1,12 @@
+ import { Injectable } from '@nestjs/common';
++import { sql } from 'kysely';
+ import { InjectKysely } from 'nestjs-kysely';
+ import type { InsertQueryBuilder, Insertable, Kysely, QueryCreator, Selectable, Updateable } from 'kysely';
+ import { columns } from 'src/database.js';
+ import { Chunked, ChunkedSet, DummyValue, GenerateSql } from 'src/decorators.js';
++import { AssetType } from 'src/enum.js';
+ import { LoggingRepository } from 'src/repositories/logging.repository.js';
++import { VIDEO_INDEX_SCHEMA, videoIndexTables } from 'src/repositories/video-index.repository.js';
+ import { DB } from 'src/schema/index.js';
+ import { TagAssetTable } from 'src/schema/tables/tag-asset.table.js';
+ import { TagTable } from 'src/schema/tables/tag.table.js';
+@@ -230,6 +233,40 @@ export class TagRepository {
+     }
+   }
+ 
++  /**
++   * The asset, when it is sensitive; otherwise undefined. Sensitive means it carries
++   * `tagValue` or a tag under it (`tagValue/...`), or shows a person marked sensitive
++   * (see VideoIndexRepository), directly or through the Live Photo still it is the
++   * motion part of. An empty `tagValue` checks people only.
++   */
++  @GenerateSql({ params: [DummyValue.UUID, DummyValue.STRING] })
++  async getSensitive(assetId: string, tagValue: string) {
++    const tables = await videoIndexTables(this.db);
++    const withPeople = tables.has('sensitive_person');
++    const under = `${tagValue.replaceAll(/[\\%_]/g, (c) => `\\${c}`)}/%`;
++    const tagged = tagValue
++      ? sql`exists (
++          select 1 from tag_asset ta join tag t on t.id = ta."tagId"
++          where ta."assetId" in (select id from target) and (t.value = ${tagValue} or t.value like ${under}))`
++      : sql`false`;
++    const shown = withPeople
++      ? sql`exists (
++          select 1 from asset_face af
++          join ${sql.id(VIDEO_INDEX_SCHEMA, 'sensitive_person')} sp on sp.person_group_id = af."personGroupId"
++          where af."assetId" in (select id from target) and af."deletedAt" is null and af."isVisible")`
++      : sql`false`;
++    const { rows } = await sql<{ id: string; type: AssetType; thumbhash: Buffer | null }>`
++      with target as (
++        select ${assetId}::uuid as id
++        union all
++        select still.id from asset still where still."livePhotoVideoId" = ${assetId}::uuid
++      )
++      select asset.id, asset.type, asset.thumbhash from asset
++      where asset.id = ${assetId}::uuid and (${tagged} or ${shown})
++    `.execute(this.db);
++    return rows[0];
++  }
++
+   insertTagWithClosures(insertTag: (db: QueryCreator<DB>) => InsertQueryBuilder<DB, 'tag', Selectable<TagTable>>) {
+     return this.db
+       .with('created_tag', insertTag)
+diff --git a/server/src/repositories/video-index.repository.ts b/server/src/repositories/video-index.repository.ts
+index c70214f..58b8a7a 100644
+--- a/server/src/repositories/video-index.repository.ts
++++ b/server/src/repositories/video-index.repository.ts
+@@ -11,6 +11,8 @@ import { DB } from 'src/schema/index.js';
+  * database role owns (`ivf` unless IMMICH_VIDEO_INDEX_SCHEMA says otherwise):
+  *   - appearance:      when each person is on screen in a video
+  *   - frame_embedding: CLIP embeddings of frames sampled through each video
++ *   - sensitive_person: people whose every photo and video is hidden until the PIN is
++ *                       entered (the one table Immich writes to, via PUT /people/:id/sensitive)
+  * Immich never writes there. Without the schema, everything here is a no-op.
+  */
+ export const VIDEO_INDEX_SCHEMA = process.env.IMMICH_VIDEO_INDEX_SCHEMA || 'ivf';
+@@ -25,7 +27,7 @@ export const videoIndexTables = async (db: Kysely<DB>): Promise<Set<string>> =>
+   }
+   const { rows } = await sql<{ name: string }>`
+     select table_name as name from information_schema.tables
+-    where table_schema = ${VIDEO_INDEX_SCHEMA} and table_name in ('appearance', 'frame_embedding')
++    where table_schema = ${VIDEO_INDEX_SCHEMA} and table_name in ('appearance', 'frame_embedding', 'sensitive_person')
+   `.execute(db);
+   cache = { at: Date.now(), tables: new Set(rows.map((row) => row.name)) };
+   return cache.tables;
+diff --git a/server/src/services/asset-media.service.spec.ts b/server/src/services/asset-media.service.spec.ts
+index 444a1fa..363b69e 100644
+--- a/server/src/services/asset-media.service.spec.ts
++++ b/server/src/services/asset-media.service.spec.ts
+@@ -1,5 +1,6 @@
+ import {
+   BadRequestException,
++  ForbiddenException,
+   InternalServerErrorException,
+   NotFoundException,
+   UnauthorizedException,
+@@ -170,6 +171,8 @@ const assetEntity = Object.freeze({
+   livePhotoVideoId: null,
+ } as MapAsset);
+ 
++const elevatedAdmin = { ...authStub.admin, session: { id: 'session-1', hasElevatedPermission: true } };
++
+ describe(AssetMediaService.name, () => {
+   let sut: AssetMediaService;
+   let mocks: ServiceMocks;
+@@ -869,4 +872,73 @@ describe(AssetMediaService.name, () => {
+       });
+     });
+   });
++
++  const tagged = (type = AssetType.Image) => {
++    const asset = AssetFactory.from({ type })
++      .file({ type: AssetFileType.Preview })
++      .file({ type: AssetFileType.EncodedVideo, path: '/path/to/encoded/video.mp4' })
++      .build();
++    mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
++    mocks.tag.getSensitive.mockResolvedValue({ id: asset.id, type, thumbhash: null } as never);
++    return asset;
++  };
++
++  describe('sensitive content', () => {
++    it('serves a placeholder instead of the thumbnail until the session is unlocked', async () => {
++      const asset = tagged();
++
++      const response = await sut.viewThumbnail(authStub.admin, asset.id, { size: AssetMediaSize.PREVIEW });
++
++      expect(response).toBeInstanceOf(ImmichFileResponse);
++      expect(response).toMatchObject({ contentType: 'image/webp', cacheControl: CacheControl.PrivateWithoutCache });
++      expect((response as ImmichFileResponse).path).toContain('immich-sensitive');
++      expect(mocks.asset.getForThumbnail).not.toHaveBeenCalled();
++    });
++
++    it('serves the real thumbnail, uncached, once unlocked', async () => {
++      const asset = tagged();
++      mocks.asset.getForThumbnail.mockResolvedValue({ ...asset, path: asset.files[0].path });
++
++      await expect(sut.viewThumbnail(elevatedAdmin, asset.id, { size: AssetMediaSize.PREVIEW })).resolves.toMatchObject(
++        {
++          path: asset.files[0].path,
++          cacheControl: CacheControl.PrivateWithoutCache,
++        },
++      );
++    });
++
++    it('serves a placeholder for an original image and refuses an original video', async () => {
++      const image = tagged();
++      await expect(sut.downloadOriginal(authStub.admin, image.id, {})).resolves.toMatchObject({
++        contentType: 'image/webp',
++      });
++
++      const video = tagged(AssetType.Video);
++      await expect(sut.downloadOriginal(authStub.admin, video.id, {})).rejects.toBeInstanceOf(ForbiddenException);
++      expect(mocks.asset.getForOriginal).not.toHaveBeenCalled();
++    });
++
++    it('refuses video playback until unlocked', async () => {
++      const asset = tagged(AssetType.Video);
++      mocks.asset.getForVideo.mockResolvedValue({
++        originalPath: asset.originalPath,
++        encodedVideoPath: asset.files[1].path,
++      });
++
++      await expect(sut.playbackVideo(authStub.admin, asset.id)).rejects.toBeInstanceOf(ForbiddenException);
++      await expect(sut.playbackVideo(elevatedAdmin, asset.id)).resolves.toMatchObject({
++        path: '/path/to/encoded/video.mp4',
++        cacheControl: CacheControl.PrivateWithoutCache,
++      });
++    });
++
++    it('always hides from shared links, which have no session to unlock', async () => {
++      const asset = tagged();
++      mocks.access.asset.checkSharedLinkAccess.mockResolvedValue(new Set([asset.id]));
++
++      await expect(sut.viewThumbnail(authStub.adminSharedLink, asset.id, {})).resolves.toMatchObject({
++        contentType: 'image/webp',
++      });
++    });
++  });
+ });
+diff --git a/server/src/services/asset-media.service.ts b/server/src/services/asset-media.service.ts
+index b12161e..f5b6818 100644
+--- a/server/src/services/asset-media.service.ts
++++ b/server/src/services/asset-media.service.ts
+@@ -21,6 +21,7 @@ import { AssetDownloadOriginalDto } from 'src/dtos/asset.dto.js';
+ import { AuthDto } from 'src/dtos/auth.dto.js';
+ import {
+   AssetFileType,
++  AssetType,
+   AssetVisibility,
+   CacheControl,
+   ChecksumAlgorithm,
+@@ -36,6 +37,12 @@ import { isAssetChecksumConstraint } from 'src/utils/database.js';
+ import { ImmichFileResponse, getFileNameWithoutExtension, getFilenameExtension } from 'src/utils/file.js';
+ import { mimeTypes } from 'src/utils/mime-types.js';
+ import { fromChecksum } from 'src/utils/request.js';
++import {
++  getSensitiveState,
++  refuseSensitive,
++  sensitiveCacheControl,
++  sensitivePlaceholder,
++} from 'src/utils/sensitive.js';
+ 
+ export interface AssetMediaRedirectResponse {
+   targetSize: AssetMediaSize | 'original';
+@@ -229,6 +236,12 @@ export class AssetMediaService extends BaseService {
+   async downloadOriginal(auth: AuthDto, id: string, dto: AssetDownloadOriginalDto): Promise<ImmichFileResponse> {
+     await this.requireAccess({ auth, permission: Permission.AssetDownload, ids: [id] });
+ 
++    const sensitive = await getSensitiveState(this.tagRepository, auth, id);
++    if (sensitive.sensitive && sensitive.hidden) {
++      // The viewer loads web-friendly images in full through this endpoint.
++      return sensitive.type === AssetType.Image ? sensitivePlaceholder(id, sensitive.thumbhash) : refuseSensitive();
++    }
++
+     if (auth.sharedLink) {
+       dto.edited = true;
+     }
+@@ -244,7 +257,7 @@ export class AssetMediaService extends BaseService {
+       path,
+       fileName: getFileNameWithoutExtension(originalFileName) + getFilenameExtension(path),
+       contentType: mimeTypes.lookup(path),
+-      cacheControl: CacheControl.PrivateWithCache,
++      cacheControl: sensitiveCacheControl(sensitive, CacheControl.PrivateWithCache),
+     });
+   }
+ 
+@@ -259,6 +272,11 @@ export class AssetMediaService extends BaseService {
+       throw new BadRequestException('May not request original file');
+     }
+ 
++    const sensitive = await getSensitiveState(this.tagRepository, auth, id);
++    if (sensitive.sensitive && sensitive.hidden) {
++      return sensitivePlaceholder(id, sensitive.thumbhash);
++    }
++
+     if (auth.sharedLink) {
+       dto.edited = true;
+     }
+@@ -293,13 +311,18 @@ export class AssetMediaService extends BaseService {
+       fileName,
+       path,
+       contentType: mimeTypes.lookup(path),
+-      cacheControl: CacheControl.PrivateWithCache,
++      cacheControl: sensitiveCacheControl(sensitive, CacheControl.PrivateWithCache),
+     });
+   }
+ 
+   async playbackVideo(auth: AuthDto, id: string): Promise<ImmichFileResponse> {
+     await this.requireAccess({ auth, permission: Permission.AssetView, ids: [id] });
+ 
++    const sensitive = await getSensitiveState(this.tagRepository, auth, id);
++    if (sensitive.hidden) {
++      refuseSensitive();
++    }
++
+     const asset = await this.assetRepository.getForVideo(id);
+ 
+     if (!asset) {
+@@ -311,7 +334,7 @@ export class AssetMediaService extends BaseService {
+     return new ImmichFileResponse({
+       path: filepath,
+       contentType: mimeTypes.lookup(filepath),
+-      cacheControl: CacheControl.PrivateWithCache,
++      cacheControl: sensitiveCacheControl(sensitive, CacheControl.PrivateWithCache),
+     });
+   }
+ 
+diff --git a/server/src/services/hls.service.ts b/server/src/services/hls.service.ts
+index 56e05b1..1c4b518 100644
+--- a/server/src/services/hls.service.ts
++++ b/server/src/services/hls.service.ts
+@@ -13,6 +13,7 @@ import { BaseService } from 'src/services/base.service.js';
+ import { PendingEvents } from 'src/utils/event.js';
+ import { ImmichFileResponse } from 'src/utils/file.js';
+ import { getCodecString, getOutputSize } from 'src/utils/media.js';
++import { getSensitiveState, refuseSensitive } from 'src/utils/sensitive.js';
+ 
+ type AssetWithStreamInfo = { videoStream: VideoStreamInfo & { timeBase: number }; packets: VideoPacketInfo };
+ type Segmentation = { fps: number; framesPerSegment: number; segmentCount: number; segmentDuration: number };
+@@ -48,6 +49,10 @@ export class HlsService extends BaseService {
+ 
+   async getMainPlaylist(auth: AuthDto, assetId: string) {
+     await this.requireAccess({ auth, permission: Permission.AssetView, ids: [assetId] });
++    const sensitive = await getSensitiveState(this.tagRepository, auth, assetId);
++    if (sensitive.hidden) {
++      refuseSensitive();
++    }
+     const { ffmpeg } = await this.getConfig({ withCache: true });
+     if (!ffmpeg.realtime.enabled) {
+       throw new BadRequestException('Real-time transcoding is not enabled');
+diff --git a/server/src/services/index.ts b/server/src/services/index.ts
+index b3e2ae1..8807bd5 100644
+--- a/server/src/services/index.ts
++++ b/server/src/services/index.ts
+@@ -30,6 +30,7 @@ import { PersonService } from 'src/services/person.service.js';
+ import { PluginService } from 'src/services/plugin.service.js';
+ import { QueueService } from 'src/services/queue.service.js';
+ import { SearchService } from 'src/services/search.service.js';
++import { SensitiveService } from 'src/services/sensitive.service.js';
+ import { ServerService } from 'src/services/server.service.js';
+ import { SessionService } from 'src/services/session.service.js';
+ import { SharedLinkService } from 'src/services/shared-link.service.js';
+@@ -55,6 +56,7 @@ import { WorkflowService } from 'src/services/workflow.service.js';
+ 
+ export const services = [
+   VideoIndexService,
++  SensitiveService,
+   ApiKeyService,
+   ActivityService,
+   AlbumService,
+diff --git a/server/src/services/person.service.ts b/server/src/services/person.service.ts
+index 124d104..55e4ca2 100644
+--- a/server/src/services/person.service.ts
++++ b/server/src/services/person.service.ts
+@@ -53,6 +53,7 @@ import { ImmichFileResponse } from 'src/utils/file.js';
+ import { isHttpException } from 'src/utils/logger.js';
+ import { mimeTypes } from 'src/utils/mime-types.js';
+ import { batched, findOrFail, hasSomeDefined, isFacialRecognitionEnabled } from 'src/utils/misc.js';
++import { sensitivePlaceholder } from 'src/utils/sensitive.js';
+ import { Point, transformPoints } from 'src/utils/transform.js';
+ 
+ const personKey = ({ ownerId, personGroupId }: PersonId) => `${ownerId}/${personGroupId}`;
+@@ -210,6 +211,10 @@ export class PersonService extends BaseService {
+       permission: Permission.PersonRead,
+       ids: [{ personGroupId, ownerId: auth.user.id }],
+     });
++    if (!auth.session?.hasElevatedPermission && (await this.personRepository.isSensitive(personGroupId))) {
++      return sensitivePlaceholder(`person-${personGroupId}`, null);
++    }
++
+     const personGroup = await this.personRepository.getForThumbnail({ ownerId: auth.user.id, personGroupId });
+     const thumbnailPath = personGroup?.thumbnailPath || personGroup?.sharedThumbnailPath;
+     if (!thumbnailPath) {
+diff --git a/server/src/services/sensitive.service.spec.ts b/server/src/services/sensitive.service.spec.ts
+new file mode 100644
+index 0000000..f1f2aee
+--- /dev/null
++++ b/server/src/services/sensitive.service.spec.ts
+@@ -0,0 +1,86 @@
++import { BadRequestException, UnauthorizedException } from '@nestjs/common';
++import { PersonService } from 'src/services/person.service.js';
++import { SensitiveService } from 'src/services/sensitive.service.js';
++import { AuthFactory } from 'test/factories/auth.factory.js';
++import { PersonFactory } from 'test/factories/person.factory.js';
++import { ServiceMocks, newTestService } from 'test/utils.js';
++
++const unlocked = (auth = AuthFactory.create()) => ({
++  ...auth,
++  session: { id: 'session-1', hasElevatedPermission: true },
++});
++
++describe(SensitiveService.name, () => {
++  let sut: SensitiveService;
++  let mocks: ServiceMocks;
++
++  beforeEach(() => {
++    ({ sut, mocks } = newTestService(SensitiveService));
++  });
++
++  const allow = (auth: { user: { id: string } }, personGroupId: string) =>
++    mocks.access.person.checkAccess.mockResolvedValue(new Set([{ personGroupId, ownerId: auth.user.id }]));
++
++  it('marks a person sensitive without the PIN', async () => {
++    const auth = AuthFactory.create();
++    const person = PersonFactory.create();
++    allow(auth, person.personGroupId);
++    mocks.person.setSensitive.mockResolvedValue(true);
++    mocks.person.isSensitive.mockResolvedValue(true);
++    mocks.person.sensitiveAvailable.mockResolvedValue(true);
++
++    await expect(sut.updatePerson(auth, person.personGroupId, { sensitive: true })).resolves.toEqual({
++      sensitive: true,
++      hidden: true,
++      available: true,
++    });
++    expect(mocks.person.setSensitive).toHaveBeenCalledWith(auth.user.id, person.personGroupId, true);
++  });
++
++  it('needs an unlocked session to show a person again', async () => {
++    const auth = AuthFactory.create();
++    const person = PersonFactory.create();
++    allow(auth, person.personGroupId);
++
++    await expect(sut.updatePerson(auth, person.personGroupId, { sensitive: false })).rejects.toBeInstanceOf(
++      UnauthorizedException,
++    );
++    expect(mocks.person.setSensitive).not.toHaveBeenCalled();
++
++    const open = unlocked(auth);
++    mocks.person.setSensitive.mockResolvedValue(true);
++    mocks.person.isSensitive.mockResolvedValue(false);
++    await expect(sut.updatePerson(open, person.personGroupId, { sensitive: false })).resolves.toMatchObject({
++      sensitive: false,
++      hidden: false,
++    });
++  });
++
++  it('requires access to the person', async () => {
++    const person = PersonFactory.create();
++    await expect(
++      sut.updatePerson(AuthFactory.create(), person.personGroupId, { sensitive: true }),
++    ).rejects.toBeInstanceOf(BadRequestException);
++    expect(mocks.person.setSensitive).not.toHaveBeenCalled();
++  });
++});
++
++describe('PersonService thumbnails of sensitive people', () => {
++  it('serves a placeholder until the session is unlocked', async () => {
++    const { sut, mocks } = newTestService(PersonService);
++    const auth = AuthFactory.create();
++    const person = PersonFactory.create();
++    mocks.access.person.checkAccess.mockResolvedValue(
++      new Set([{ personGroupId: person.personGroupId, ownerId: auth.user.id }]),
++    );
++    mocks.person.isSensitive.mockResolvedValue(true);
++    mocks.person.getForThumbnail.mockResolvedValue({ thumbnailPath: person.thumbnailPath, sharedThumbnailPath: null });
++
++    await expect(sut.getThumbnail(auth, person.personGroupId)).resolves.toMatchObject({ contentType: 'image/webp' });
++    expect(mocks.person.getForThumbnail).not.toHaveBeenCalled();
++
++    await expect(sut.getThumbnail(unlocked(auth), person.personGroupId)).resolves.toMatchObject({
++      path: person.thumbnailPath,
++    });
++  });
++});
+diff --git a/server/src/services/sensitive.service.ts b/server/src/services/sensitive.service.ts
+new file mode 100644
+index 0000000..76d9cbe
+--- /dev/null
++++ b/server/src/services/sensitive.service.ts
+@@ -0,0 +1,54 @@
++import { BadRequestException, Injectable } from '@nestjs/common';
++import { AuthDto } from 'src/dtos/auth.dto.js';
++import {
++  AssetSensitiveResponseDto,
++  PersonSensitiveResponseDto,
++  PersonSensitiveUpdateDto,
++} from 'src/dtos/sensitive.dto.js';
++import { Permission } from 'src/enum.js';
++import { BaseService } from 'src/services/base.service.js';
++import { requireElevatedPermission } from 'src/utils/access.js';
++import { SENSITIVE_TAG, getSensitiveState } from 'src/utils/sensitive.js';
++
++/** Sensitive assets and people: what is hidden until the PIN is entered (see utils/sensitive). */
++@Injectable()
++export class SensitiveService extends BaseService {
++  async getAsset(auth: AuthDto, id: string): Promise<AssetSensitiveResponseDto> {
++    await this.requireAccess({ auth, permission: Permission.AssetRead, ids: [id] });
++    const { sensitive, hidden } = await getSensitiveState(this.tagRepository, auth, id);
++    return { sensitive, hidden, tag: SENSITIVE_TAG };
++  }
++
++  async getPerson(auth: AuthDto, personGroupId: string): Promise<PersonSensitiveResponseDto> {
++    await this.requirePersonAccess({
++      auth,
++      permission: Permission.PersonRead,
++      ids: [{ personGroupId, ownerId: auth.user.id }],
++    });
++    const sensitive = await this.personRepository.isSensitive(personGroupId);
++    const available = await this.personRepository.sensitiveAvailable();
++    return { sensitive, hidden: sensitive && !auth.session?.hasElevatedPermission, available };
++  }
++
++  async updatePerson(
++    auth: AuthDto,
++    personGroupId: string,
++    dto: PersonSensitiveUpdateDto,
++  ): Promise<PersonSensitiveResponseDto> {
++    await this.requirePersonAccess({
++      auth,
++      permission: Permission.PersonUpdate,
++      ids: [{ personGroupId, ownerId: auth.user.id }],
++    });
++    // Hiding someone needs nothing; showing them again needs the PIN, like viewing them.
++    if (!dto.sensitive) {
++      requireElevatedPermission(auth);
++    }
++    if (!(await this.personRepository.setSensitive(auth.user.id, personGroupId, dto.sensitive))) {
++      throw new BadRequestException(
++        'People cannot be marked sensitive: the video index schema has no sensitive_person table',
++      );
++    }
++    return this.getPerson(auth, personGroupId);
++  }
++}
+diff --git a/server/src/utils/sensitive.spec.ts b/server/src/utils/sensitive.spec.ts
+new file mode 100644
+index 0000000..eeee50e
+--- /dev/null
++++ b/server/src/utils/sensitive.spec.ts
+@@ -0,0 +1,25 @@
++import sharp from 'sharp';
++import { renderSensitivePlaceholder } from 'src/utils/sensitive.js';
++
++describe('renderSensitivePlaceholder', () => {
++  it('renders a webp at the thumbhash aspect ratio', async () => {
++    const { rgbaToThumbHash } = await import('thumbhash');
++    const width = 40;
++    const height = 20;
++    const rgba = new Uint8Array(width * height * 4).fill(200);
++    const hash = Buffer.from(rgbaToThumbHash(width, height, rgba));
++
++    const meta = await sharp(await renderSensitivePlaceholder(hash)).metadata();
++
++    expect(meta.format).toBe('webp');
++    expect(meta.width).toBe(480);
++    // A thumbhash keeps the aspect ratio only approximately.
++    expect(meta.height! / meta.width!).toBeGreaterThan(0.4);
++    expect(meta.height! / meta.width!).toBeLessThan(0.7);
++  });
++
++  it('renders a neutral square without a thumbhash', async () => {
++    const meta = await sharp(await renderSensitivePlaceholder(null)).metadata();
++    expect([meta.width, meta.height]).toEqual([480, 480]);
++  });
++});
+diff --git a/server/src/utils/sensitive.ts b/server/src/utils/sensitive.ts
+new file mode 100644
+index 0000000..f9069da
+--- /dev/null
++++ b/server/src/utils/sensitive.ts
+@@ -0,0 +1,102 @@
++import { ForbiddenException } from '@nestjs/common';
++import { mkdir, rename, stat, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import sharp, { Sharp } from 'sharp';
++import { AuthDto } from 'src/dtos/auth.dto.js';
++import { AssetType, CacheControl } from 'src/enum.js';
++import { TagRepository } from 'src/repositories/tag.repository.js';
++import { ImmichFileResponse } from 'src/utils/file.js';
++
++/**
++ * Sensitive content: an asset tagged with this tag, or with one under it such as
++ * `Sensitive/Explicit`, or showing a person marked sensitive, stays in the timeline,
++ * search and albums, but every image of it is served as a blurred placeholder, and its
++ * video and original are refused, until the session is unlocked with the user's PIN
++ * (the same unlock as the Locked Folder). A Live Photo's motion part follows its still.
++ * Empty turns off the tag; people marked sensitive still apply.
++ */
++export const SENSITIVE_TAG = process.env.IMMICH_SENSITIVE_TAG ?? 'Sensitive';
++
++export type SensitiveState =
++  { sensitive: false; hidden: false } | { sensitive: true; hidden: boolean; type: AssetType; thumbhash: Buffer | null };
++
++const NOT_SENSITIVE: SensitiveState = { sensitive: false, hidden: false };
++
++export const getSensitiveState = async (
++  tagRepository: TagRepository,
++  auth: AuthDto,
++  assetId: string,
++): Promise<SensitiveState> => {
++  const row = await tagRepository.getSensitive(assetId, SENSITIVE_TAG);
++  if (!row) {
++    return NOT_SENSITIVE;
++  }
++  // Shared links and API keys have no session to unlock, so they always see the placeholder.
++  const hidden = !auth.session?.hasElevatedPermission;
++  return { sensitive: true, hidden, type: row.type, thumbhash: row.thumbhash };
++};
++
++/** Sensitive media must not be reused from a browser cache once the session locks again. */
++export const sensitiveCacheControl = (state: SensitiveState, otherwise: CacheControl) =>
++  state.sensitive ? CacheControl.PrivateWithoutCache : otherwise;
++
++export const refuseSensitive = () => {
++  throw new ForbiddenException('Sensitive content: unlock with your PIN to view it');
++};
++
++const PLACEHOLDER_DIR = join(tmpdir(), 'immich-sensitive');
++const PLACEHOLDER_WIDTH = 480;
++// mdiEyeOff
++const EYE_OFF =
++  'M11.83,9L15,12.16C15,12.11 15,12.05 15,12A3,3 0 0,0 12,9C11.94,9 11.89,9 11.83,9M7.53,9.8L9.08,11.35C9.03,11.56 9,11.77 9,12A3,3 0 0,0 12,15C12.22,15 12.44,14.97 12.65,14.92L14.2,16.47C13.53,16.8 12.79,17 12,17A5,5 0 0,1 7,12C7,11.21 7.2,10.47 7.53,9.8M2,4.27L4.28,6.55L4.73,7C3.08,8.3 1.78,10 1,12C2.73,16.39 7,19.5 12,19.5C13.55,19.5 15.03,19.2 16.38,18.66L16.81,19.08L19.73,22L21,20.73L3.27,3M12,7A5,5 0 0,1 17,12C17,12.64 16.87,13.26 16.64,13.82L19.57,16.75C21.07,15.5 22.27,13.86 23,12C21.27,7.61 17,4.5 12,4.5C10.6,4.5 9.26,4.75 8,5.2L10.17,7.35C10.74,7.13 11.35,7 12,7Z';
++
++/**
++ * The asset's thumbhash (the blurred placeholder Immich already shows while a thumbnail
++ * loads) enlarged, darkened, and marked with a crossed-out eye. Rendered once per asset
++ * and thumbhash into the server's private temp directory.
++ */
++export const renderSensitivePlaceholder = async (thumbhash: Buffer | null): Promise<Buffer> => {
++  let base: Sharp;
++  let ratio = 1;
++  if (thumbhash && thumbhash.length > 0) {
++    const { thumbHashToRGBA } = await import('thumbhash');
++    const { w, h, rgba } = thumbHashToRGBA(thumbhash);
++    ratio = h / w;
++    base = sharp(Buffer.from(rgba), { raw: { width: w, height: h, channels: 4 } });
++  } else {
++    base = sharp({ create: { width: 4, height: 4, channels: 4, background: '#4b5563' } });
++  }
++  const width = PLACEHOLDER_WIDTH;
++  const height = Math.max(1, Math.round(width * Math.min(Math.max(ratio, 0.25), 4)));
++  const icon = Math.round(Math.min(width, height) * 0.3);
++  const overlay = Buffer.from(
++    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">` +
++      `<rect width="100%" height="100%" fill="#000" fill-opacity="0.35"/>` +
++      `<g transform="translate(${(width - icon) / 2},${(height - icon) / 2}) scale(${icon / 24})">` +
++      `<path fill="#fff" fill-opacity="0.9" d="${EYE_OFF}"/></g></svg>`,
++  );
++  const blurred = await base.resize(width, height, { kernel: 'cubic', fit: 'fill' }).blur(12).png().toBuffer();
++  return sharp(blurred)
++    .composite([{ input: overlay }])
++    .webp({ quality: 70 })
++    .toBuffer();
++};
++
++export const sensitivePlaceholder = async (id: string, thumbhash: Buffer | null) => {
++  const key = thumbhash ? thumbhash.toString('hex').slice(0, 16) : 'none';
++  const path = join(PLACEHOLDER_DIR, `${id}-${key}.webp`);
++  try {
++    await stat(path);
++  } catch {
++    await mkdir(PLACEHOLDER_DIR, { recursive: true });
++    const partial = `${path}.${process.pid}.tmp`;
++    await writeFile(partial, await renderSensitivePlaceholder(thumbhash));
++    await rename(partial, path);
++  }
++  return new ImmichFileResponse({
++    path,
++    contentType: 'image/webp',
++    cacheControl: CacheControl.PrivateWithoutCache,
++  });
++};
+-- 
+2.56.0
+

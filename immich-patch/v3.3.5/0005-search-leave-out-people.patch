@@ -1,0 +1,298 @@
+From c1412ebae761b1f40d5bc842a69d078dc5c3d493 Mon Sep 17 00:00:00 2001
+From: DCS <claude@dcs.io>
+Date: Thu, 5 Nov 2026 00:43:27 -0800
+Subject: [PATCH 5/5] search: leave out people
+
+excludePersonIds on metadata, smart, random and statistics search leaves
+out assets showing any of those people. In the search filters, clicking a
+selected person again leaves them out.
+---
+ packages/sdk/src/fetch-client.ts              |  8 +++++++
+ server/src/dtos/search.dto.ts                 |  5 +++++
+ server/src/repositories/search.repository.ts  |  1 +
+ server/src/utils/database.ts                  | 15 +++++++++++++
+ .../search-bar/SearchFilters.svelte           | 12 ++++++++---
+ .../search-bar/SearchPeopleSection.svelte     | 21 +++++++++++++++----
+ .../search-bar/search-bar-utils.ts            | 15 ++++++++++++-
+ web/src/lib/managers/search-manager.svelte.ts |  2 ++
+ web/src/lib/types.ts                          |  2 ++
+ .../[[assetId=id]]/+page.svelte               |  3 ++-
+ 10 files changed, 75 insertions(+), 9 deletions(-)
+
+diff --git a/packages/sdk/src/fetch-client.ts b/packages/sdk/src/fetch-client.ts
+index 0db0a19..0314e28 100644
+--- a/packages/sdk/src/fetch-client.ts
++++ b/packages/sdk/src/fetch-client.ts
+@@ -2447,6 +2447,8 @@ export type MetadataSearchDto = {
+     /** Page number */
+     page?: number;
+     /** Filter by person IDs */
++    /** Leave out assets showing any of these people */
++    excludePersonIds?: string[];
+     personIds?: string[];
+     /** Filter by preview file path */
+     previewPath?: string;
+@@ -2563,6 +2565,8 @@ export type RandomSearchDto = {
+     /** Filter by OCR text content */
+     ocr?: string;
+     /** Filter by person IDs */
++    /** Leave out assets showing any of these people */
++    excludePersonIds?: string[];
+     personIds?: string[];
+     /** Filter by rating [1-5], or null for unrated */
+     rating?: number | null;
+@@ -2632,6 +2636,8 @@ export type SmartSearchDto = {
+     /** Page number */
+     page?: number;
+     /** Filter by person IDs */
++    /** Leave out assets showing any of these people */
++    excludePersonIds?: string[];
+     personIds?: string[];
+     /** Natural language search query */
+     query?: string;
+@@ -2699,6 +2705,8 @@ export type StatisticsSearchDto = {
+     /** Filter by OCR text content */
+     ocr?: string;
+     /** Filter by person IDs */
++    /** Leave out assets showing any of these people */
++    excludePersonIds?: string[];
+     personIds?: string[];
+     /** Filter by rating [1-5], or null for unrated */
+     rating?: number | null;
+diff --git a/server/src/dtos/search.dto.ts b/server/src/dtos/search.dto.ts
+index be39fd2..e1fa0e0 100644
+--- a/server/src/dtos/search.dto.ts
++++ b/server/src/dtos/search.dto.ts
+@@ -46,6 +46,11 @@ const BaseSearchSchema = z.object({
+   lensModel: z.string().nullable().optional().describe('Filter by lens model').meta(DEPRECATED_FLAT_FIELD),
+   isNotInAlbum: z.boolean().optional().describe('Filter assets not in any album').meta(DEPRECATED_FLAT_FIELD),
+   personIds: z.array(z.uuidv4()).optional().describe('Filter by person IDs').meta(DEPRECATED_FLAT_FIELD),
++  excludePersonIds: z
++    .array(z.uuidv4())
++    .optional()
++    .describe('Leave out assets showing any of these people')
++    .meta(new HistoryBuilder().added('v3.3.5').getExtensions()),
+   tagIds: z.array(z.uuidv4()).nullish().describe('Filter by tag IDs').meta(DEPRECATED_FLAT_FIELD),
+   albumIds: z.array(z.uuidv4()).optional().describe('Filter by album IDs').meta(DEPRECATED_FLAT_FIELD),
+   rating: z
+diff --git a/server/src/repositories/search.repository.ts b/server/src/repositories/search.repository.ts
+index 353eb5a..1ff0e3a 100644
+--- a/server/src/repositories/search.repository.ts
++++ b/server/src/repositories/search.repository.ts
+@@ -102,6 +102,7 @@ export interface SearchOcrOptions {
+ 
+ export interface SearchPeopleOptions {
+   personIds?: string[];
++  excludePersonIds?: string[];
+ }
+ 
+ export interface SearchTagOptions {
+diff --git a/server/src/utils/database.ts b/server/src/utils/database.ts
+index 985d7bb..f845479 100644
+--- a/server/src/utils/database.ts
++++ b/server/src/utils/database.ts
+@@ -442,6 +442,21 @@ export function searchAssetBuilderLegacy(kysely: Kysely<DB>, options: AssetSearc
+       qb.where((eb) => eb.not(eb.exists((eb) => eb.selectFrom('tag_asset').whereRef('assetId', '=', 'asset.id')))),
+     )
+     .$if(!!options.personIds && options.personIds.length > 0, (qb) => hasPeople(qb, options.personIds!))
++    .$if(!!options.excludePersonIds && options.excludePersonIds.length > 0, (qb) =>
++      qb.where((eb) =>
++        eb.not(
++          eb.exists(
++            eb
++              .selectFrom('asset_face')
++              .select('asset_face.assetId')
++              .whereRef('asset_face.assetId', '=', 'asset.id')
++              .where('asset_face.personGroupId', '=', anyUuid(options.excludePersonIds!))
++              .where('asset_face.deletedAt', 'is', null)
++              .where('asset_face.isVisible', 'is', true),
++          ),
++        ),
++      ),
++    )
+     .$if(!!options.createdBefore, (qb) => qb.where('asset.createdAt', '<=', options.createdBefore!))
+     .$if(!!options.createdAfter, (qb) => qb.where('asset.createdAt', '>=', options.createdAfter!))
+     .$if(!!options.updatedBefore, (qb) => qb.where('asset.updatedAt', '<=', options.updatedBefore!))
+diff --git a/web/src/lib/components/shared-components/search-bar/SearchFilters.svelte b/web/src/lib/components/shared-components/search-bar/SearchFilters.svelte
+index ab74aaf..729ce8b 100644
+--- a/web/src/lib/components/shared-components/search-bar/SearchFilters.svelte
++++ b/web/src/lib/components/shared-components/search-bar/SearchFilters.svelte
+@@ -1,5 +1,6 @@
+ <script lang="ts">
+   import SearchHistorySection from './SearchHistorySection.svelte';
++  import { SvelteSet } from 'svelte/reactivity';
+   import { t } from 'svelte-i18n';
+   import { fly } from 'svelte/transition';
+   import { Button, Text } from '@immich/ui';
+@@ -143,8 +144,9 @@
+   };
+ 
+   onMount(() => {
+-    if (searchManager.filter.personIds.size > 0 && !peoplePromise) {
+-      peoplePromise = getPeople(searchManager.filter.personIds);
++    const chosen = new SvelteSet([...searchManager.filter.personIds, ...searchManager.filter.excludedPersonIds]);
++    if (chosen.size > 0 && !peoplePromise) {
++      peoplePromise = getPeople(chosen);
+       void peoplePromise.then((res) => (people = res));
+     }
+ 
+@@ -156,7 +158,11 @@
+ 
+   $effect(() => {
+     if (people) {
+-      peopleTitle = getSearchPeopleTitle(people, searchManager.filter.personIds);
++      peopleTitle = getSearchPeopleTitle(
++        people,
++        searchManager.filter.personIds,
++        searchManager.filter.excludedPersonIds,
++      );
+     }
+   });
+ 
+diff --git a/web/src/lib/components/shared-components/search-bar/SearchPeopleSection.svelte b/web/src/lib/components/shared-components/search-bar/SearchPeopleSection.svelte
+index ce2c0ca..e76bffb 100644
+--- a/web/src/lib/components/shared-components/search-bar/SearchPeopleSection.svelte
++++ b/web/src/lib/components/shared-components/search-bar/SearchPeopleSection.svelte
+@@ -6,7 +6,8 @@
+   import { getPeopleThumbnailUrl } from '$lib/utils';
+   import { type PersonResponseDto } from '@immich/sdk';
+   import { Button, Icon, LoadingSpinner, Text } from '@immich/ui';
+-  import { mdiArrowRight, mdiCheck, mdiClose } from '@mdi/js';
++  import { mdiArrowRight, mdiCancel, mdiCheck, mdiClose } from '@mdi/js';
++  import { SvelteSet } from 'svelte/reactivity';
+   import { t } from 'svelte-i18n';
+   import { searchManager } from '$lib/managers/search-manager.svelte';
+ 
+@@ -19,19 +20,24 @@
+   let { title = $bindable(), parentPromise }: Props = $props();
+ 
+   let selectedPeople = $derived(searchManager.filter.personIds);
+-  let peoplePromise = parentPromise ?? getPeople(selectedPeople);
++  let excludedPeople = $derived(searchManager.filter.excludedPersonIds);
++  let peoplePromise = parentPromise ?? getPeople(new SvelteSet([...selectedPeople, ...excludedPeople]));
+   let showAllPeople = $state(false);
+   let name = $state('');
+   let numberOfPeople = $state(1);
+ 
++  // Each click moves a person on: shown -> left out -> not filtered.
+   function togglePersonSelection(id: string, people: PersonResponseDto[]) {
+     if (selectedPeople.has(id)) {
+       selectedPeople.delete(id);
++      excludedPeople.add(id);
++    } else if (excludedPeople.has(id)) {
++      excludedPeople.delete(id);
+     } else {
+       selectedPeople.add(id);
+     }
+ 
+-    title = getSearchPeopleTitle(people, selectedPeople);
++    title = getSearchPeopleTitle(people, selectedPeople, excludedPeople);
+   }
+ 
+   const filterPeople = (list: PersonResponseDto[], name: string) => {
+@@ -51,7 +57,7 @@
+       : filterPeople(people, name).slice(0, numberOfPeople)}
+ 
+     <div id="people-selection" class="max-h-80 immich-scrollbar overflow-y-auto">
+-      <Text class="pb-5">{$t('people_search_description')}</Text>
++      <Text class="pb-5">{$t('people_search_description')} Click a person again to leave them out.</Text>
+       <SearchBar bind:name placeholder={$t('filter_people')} showLoadingSpinner={false} />
+ 
+       <SingleGridRow
+@@ -78,6 +84,13 @@
+                 >
+                   <Icon icon={mdiCheck} size="32" color="white" />
+                 </div>
++              {:else if excludedPeople.has(person.id)}
++                <div
++                  class="absolute top-0 flex size-full items-center justify-center rounded-full bg-danger opacity-75"
++                  title="Left out"
++                >
++                  <Icon icon={mdiCancel} size="32" color="white" />
++                </div>
+               {/if}
+             </div>
+             <p class="mt-2 line-clamp-2 text-sm font-medium dark:text-white">{person.name}</p>
+diff --git a/web/src/lib/components/shared-components/search-bar/search-bar-utils.ts b/web/src/lib/components/shared-components/search-bar/search-bar-utils.ts
+index 7b56d1a..3243206 100644
+--- a/web/src/lib/components/shared-components/search-bar/search-bar-utils.ts
++++ b/web/src/lib/components/shared-components/search-bar/search-bar-utils.ts
+@@ -149,7 +149,20 @@ export const getPeople = async (selected: SvelteSet<string>): Promise<PersonResp
+   return [];
+ };
+ 
+-export const getSearchPeopleTitle = (people: PersonResponseDto[], selected: SvelteSet<string>) => {
++export const getSearchPeopleTitle = (
++  people: PersonResponseDto[],
++  selected: SvelteSet<string>,
++  excluded?: SvelteSet<string>,
++) => {
++  const included = describePeople(people, selected);
++  const left = excluded ? describePeople(people, excluded) : undefined;
++  if (!left) {
++    return included;
++  }
++  return included ? `${included}, not ${left}` : `Not ${left}`;
++};
++
++const describePeople = (people: PersonResponseDto[], selected: SvelteSet<string>) => {
+   if (selected.size === 0) {
+     return;
+   }
+diff --git a/web/src/lib/managers/search-manager.svelte.ts b/web/src/lib/managers/search-manager.svelte.ts
+index 32cd379..8ff8e99 100644
+--- a/web/src/lib/managers/search-manager.svelte.ts
++++ b/web/src/lib/managers/search-manager.svelte.ts
+@@ -63,6 +63,7 @@ class SearchManager {
+       queryType,
+       queryAssetId: 'queryAssetId' in searchQuery ? searchQuery.queryAssetId : undefined,
+       personIds: new SvelteSet('personIds' in searchQuery ? searchQuery.personIds : []),
++      excludedPersonIds: new SvelteSet('excludePersonIds' in searchQuery ? (searchQuery.excludePersonIds ?? []) : []),
+       tagIds:
+         'tagIds' in searchQuery
+           ? searchQuery.tagIds === null
+@@ -131,6 +132,7 @@ class SearchManager {
+       isFavorite: this.filter.display.isFavorite || undefined,
+       isNotInAlbum: this.filter.display.isNotInAlbum || undefined,
+       personIds: this.filter.personIds.size > 0 ? [...this.filter.personIds] : undefined,
++      excludePersonIds: this.filter.excludedPersonIds.size > 0 ? [...this.filter.excludedPersonIds] : undefined,
+       tagIds: this.filter.tagIds === null ? null : this.filter.tagIds.size > 0 ? [...this.filter.tagIds] : undefined,
+       type,
+       rating: this.filter.rating,
+diff --git a/web/src/lib/types.ts b/web/src/lib/types.ts
+index b6865f1..4206ad6 100644
+--- a/web/src/lib/types.ts
++++ b/web/src/lib/types.ts
+@@ -66,6 +66,8 @@ export type SearchFilter = {
+   ocr?: string;
+   queryType: 'smart' | 'metadata' | 'description' | 'fullPath' | 'ocr';
+   personIds: SvelteSet<string>;
++  /** People whose assets are left out of the results. */
++  excludedPersonIds: SvelteSet<string>;
+   tagIds: SvelteSet<string> | null;
+   location: SearchLocationFilter;
+   queryAssetId?: string;
+diff --git a/web/src/routes/(user)/search/[[photos=photos]]/[[assetId=id]]/+page.svelte b/web/src/routes/(user)/search/[[photos=photos]]/[[assetId=id]]/+page.svelte
+index b4c6921..68324b5 100644
+--- a/web/src/routes/(user)/search/[[photos=photos]]/[[assetId=id]]/+page.svelte
++++ b/web/src/routes/(user)/search/[[photos=photos]]/[[assetId=id]]/+page.svelte
+@@ -184,6 +184,7 @@
+       model: $t('camera_model'),
+       lensModel: $t('lens_model'),
+       personIds: $t('people'),
++      excludePersonIds: 'Not',
+       tagIds: $t('tags'),
+       originalFileName: $t('file_name_text'),
+       originalPath: $t('full_path_or_folder'),
+@@ -270,7 +271,7 @@
+             <span class="max-w-[min(36rem,55vw)] min-w-0 truncate px-3 py-1.5 text-immich-fg dark:text-immich-dark-fg">
+               {#if (searchKey === 'takenAfter' || searchKey === 'takenBefore') && typeof value === 'string'}
+                 {getHumanReadableDate(value)}
+-              {:else if searchKey === 'personIds' && Array.isArray(value)}
++              {:else if (searchKey === 'personIds' || searchKey === 'excludePersonIds') && Array.isArray(value)}
+                 {#await getPersonName(value) then personName}
+                   {personName}
+                 {/await}
+-- 
+2.56.0
+

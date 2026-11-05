@@ -1,7 +1,7 @@
 From f747182dffc820e0c3c6c6640231ee6928bf5713 Mon Sep 17 00:00:00 2001
 From: DCS <claude@dcs.io>
 Date: Wed, 4 Nov 2026 02:20:53 -0800
-Subject: [PATCH 2/2] web: people-on-screen timeline in the video player
+Subject: [PATCH 2/5] web: people-on-screen timeline in the video player
 
 Rows above the time range mark when each recognised person is on screen;
 clicking a mark seeks there. Shown only for videos the index covers.

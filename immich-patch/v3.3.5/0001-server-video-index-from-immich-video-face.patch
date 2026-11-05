@@ -1,7 +1,7 @@
 From 1a335c677c864327c45a9a726810554e2d86a6aa Mon Sep 17 00:00:00 2001
 From: DCS <claude@dcs.io>
 Date: Wed, 4 Nov 2026 02:20:53 -0800
-Subject: [PATCH 1/2] server: video index from immich-video-face
+Subject: [PATCH 1/5] server: video index from immich-video-face
 
 GET /api/assets/:id/appearances returns who is on screen when in a video, and
 smart search also matches a video through CLIP embeddings of frames sampled
