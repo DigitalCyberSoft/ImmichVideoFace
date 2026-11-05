@@ -1,0 +1,148 @@
+From 72558ffcd7db5cb97c5fe12a3f603a9a382fef08 Mon Sep 17 00:00:00 2001
+From: DCS <claude@dcs.io>
+Date: Wed, 4 Nov 2026 02:20:53 -0800
+Subject: [PATCH 2/6] web: people-on-screen timeline in the video player
+
+Rows above the time range mark when each recognised person is on screen;
+clicking a mark seeks there. Shown only for videos the index covers.
+---
+ .../asset-viewer/VideoNativeViewer.svelte     |  4 +-
+ .../asset-viewer/VideoPeopleTimeline.svelte   | 98 +++++++++++++++++++
+ 2 files changed, 101 insertions(+), 1 deletion(-)
+ create mode 100644 web/src/lib/components/asset-viewer/VideoPeopleTimeline.svelte
+
+diff --git a/web/src/lib/components/asset-viewer/VideoNativeViewer.svelte b/web/src/lib/components/asset-viewer/VideoNativeViewer.svelte
+index 74b0ea5..9cefdd7 100644
+--- a/web/src/lib/components/asset-viewer/VideoNativeViewer.svelte
++++ b/web/src/lib/components/asset-viewer/VideoNativeViewer.svelte
+@@ -1,5 +1,6 @@
+ <script lang="ts">
+   import FaceEditor from '$lib/components/asset-viewer/face-editor/FaceEditor.svelte';
++  import VideoPeopleTimeline from '$lib/components/asset-viewer/VideoPeopleTimeline.svelte';
+   import VideoRemoteViewer from '$lib/components/asset-viewer/VideoRemoteViewer.svelte';
+   import { assetViewerFadeDuration } from '$lib/constants';
+   import { assetViewerManager } from '$lib/managers/asset-viewer-manager.svelte';
+@@ -453,7 +454,7 @@
+           </media-settings-menu>
+         {/if}
+ 
+-        <div class="flex h-32 w-full flex-col justify-end bg-linear-to-b to-black/80 px-4">
++        <div class="flex min-h-32 w-full flex-col justify-end bg-linear-to-b to-black/80 px-4">
+           <media-control-bar part="bottom" class="flex h-10 w-full gap-2">
+             <media-play-button class="shrink-0 rounded-full p-2 outline-none">
+               <Icon slot="play" icon={mdiPlay} />
+@@ -483,6 +484,7 @@
+               <media-settings-menu-button class="shrink-0 rounded-full p-2 outline-none"></media-settings-menu-button>
+             {/if}
+           </media-control-bar>
++          <VideoPeopleTimeline {assetId} {videoPlayer} />
+           <immich-time-range class="h-8 w-full rounded-lg px-2 pb-3 outline-none"></immich-time-range>
+         </div>
+       </media-controller>
+diff --git a/web/src/lib/components/asset-viewer/VideoPeopleTimeline.svelte b/web/src/lib/components/asset-viewer/VideoPeopleTimeline.svelte
+new file mode 100644
+index 0000000..f617781
+--- /dev/null
++++ b/web/src/lib/components/asset-viewer/VideoPeopleTimeline.svelte
+@@ -0,0 +1,98 @@
++<script lang="ts">
++  // immich-video-face: who is on screen when, drawn as rows lined up with the time range below.
++  // Data comes from GET /api/assets/:id/appearances, which is empty unless the video was indexed.
++  import { assetViewerManager } from '$lib/managers/asset-viewer-manager.svelte';
++  import { authManager } from '$lib/managers/auth-manager.svelte';
++  import { getPeopleThumbnailUrl } from '$lib/utils';
++  import type { PersonResponseDto } from '@immich/sdk';
++
++  type Appearance = {
++    person: { id: string; name: string; isHidden: boolean; color?: string; updatedAt: string };
++    segments: [number, number][];
++  };
++
++  interface Props {
++    assetId: string;
++    videoPlayer: HTMLVideoElement | undefined;
++  }
++
++  const { assetId, videoPlayer }: Props = $props();
++
++  const MAX_ROWS = 5;
++  const PALETTE = ['#60a5fa', '#fbbf24', '#34d399', '#f87171', '#a78bfa', '#22d3ee'];
++
++  let appearances = $state<Appearance[]>([]);
++  let durationMs = $state(0);
++
++  $effect(() => {
++    const id = assetId;
++    appearances = [];
++    durationMs = 0;
++    if (authManager.isSharedLink) {
++      return;
++    }
++    const controller = new AbortController();
++    fetch(`/api/assets/${id}/appearances`, { signal: controller.signal })
++      .then((response) => (response.ok ? response.json() : undefined))
++      .then((body?: { durationMs: number | null; appearances: Appearance[] }) => {
++        if (body) {
++          appearances = body.appearances ?? [];
++          durationMs = body.durationMs ?? 0;
++        }
++      })
++      .catch(() => {});
++    return () => controller.abort();
++  });
++
++  const rows = $derived(
++    appearances.filter((a) => assetViewerManager.isShowingHiddenPeople || !a.person.isHidden).slice(0, MAX_ROWS),
++  );
++
++  const formatTime = (ms: number) => {
++    const total = Math.round(ms / 1000);
++    const minutes = Math.floor(total / 60);
++    const seconds = String(total % 60).padStart(2, '0');
++    return minutes >= 60
++      ? `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, '0')}:${seconds}`
++      : `${minutes}:${seconds}`;
++  };
++
++  const percent = (ms: number) => `${Math.min(100, Math.max(0, (ms / durationMs) * 100))}%`;
++
++  const seek = (event: Event, ms: number) => {
++    event.stopPropagation();
++    if (videoPlayer) {
++      videoPlayer.currentTime = ms / 1000;
++    }
++  };
++</script>
++
++{#if rows.length > 0 && durationMs > 0}
++  <div class="mb-1 flex w-full flex-col gap-1.5 px-2" role="group" aria-label="People on screen">
++    {#each rows as { person, segments }, index (person.id)}
++      {@const color = person.color || PALETTE[index % PALETTE.length]}
++      {@const label = person.name || 'Unnamed person'}
++      <div class="relative h-1.5 w-full">
++        <img
++          src={getPeopleThumbnailUrl(person as unknown as PersonResponseDto)}
++          alt={label}
++          title={label}
++          class="pointer-events-none absolute top-1/2 -left-5.5 size-4 -translate-y-1/2 rounded-full object-cover"
++          style:outline="1.5px solid {color}"
++        />
++        {#each segments as [start, end] (start)}
++          <button
++            type="button"
++            class="absolute top-0 h-full min-w-1 cursor-pointer rounded-sm opacity-75 transition-opacity hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-1 focus-visible:outline-white"
++            style:left={percent(start)}
++            style:width={percent(end - start)}
++            style:background={color}
++            title="{label} · {formatTime(start)}–{formatTime(end)}"
++            aria-label="{label}, {formatTime(start)} to {formatTime(end)}"
++            onclick={(event) => seek(event, start)}
++          ></button>
++        {/each}
++      </div>
++    {/each}
++  </div>
++{/if}
+-- 
+2.56.0
+

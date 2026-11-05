@@ -1,0 +1,253 @@
+From ba1410e2472d552bf3f4d64887355655fbe28c29 Mon Sep 17 00:00:00 2001
+From: DCS <claude@dcs.io>
+Date: Thu, 5 Nov 2026 00:43:27 -0800
+Subject: [PATCH 4/6] web: unlock sensitive content from the viewer, hide
+ people behind the PIN
+
+The viewer offers the PIN prompt on a hidden sensitive asset (and does not
+load its video), and a way to lock the session again once shown. A person's
+menu gains Hide behind PIN / Stop hiding behind PIN.
+---
+ .../asset-viewer/AssetViewer.svelte           | 17 +++-
+ .../asset-viewer/SensitiveOverlay.svelte      | 83 +++++++++++++++++++
+ .../[[assetId=id]]/+page.svelte               | 57 ++++++++++++-
+ 3 files changed, 154 insertions(+), 3 deletions(-)
+ create mode 100644 web/src/lib/components/asset-viewer/SensitiveOverlay.svelte
+
+diff --git a/web/src/lib/components/asset-viewer/AssetViewer.svelte b/web/src/lib/components/asset-viewer/AssetViewer.svelte
+index 4873b0b..d4e54f2 100644
+--- a/web/src/lib/components/asset-viewer/AssetViewer.svelte
++++ b/web/src/lib/components/asset-viewer/AssetViewer.svelte
+@@ -20,7 +20,7 @@
+   import { ocrManager } from '$lib/stores/ocr.svelte';
+   import { alwaysLoadOriginalVideo } from '$lib/stores/preferences.store';
+   import { SlideshowNavigation, SlideshowState, slideshowStore } from '$lib/stores/slideshow.store';
+-  import { getSharedLink, handlePromiseError } from '$lib/utils';
++  import { getAssetMediaUrl, getSharedLink, handlePromiseError } from '$lib/utils';
+   import type { OnUndoDelete } from '$lib/utils/actions';
+   import { navigateToAsset } from '$lib/utils/asset-utils';
+   import { handleError } from '$lib/utils/handle-error';
+@@ -29,6 +29,7 @@
+   import { SlideshowHistory } from '$lib/utils/slideshow-history';
+   import { toTimelineAsset } from '$lib/utils/timeline-util';
+   import {
++    AssetMediaSize,
+     AssetTypeEnum,
+     getAssetInfo,
+     getStack,
+@@ -51,6 +52,7 @@
+   import ImagePanoramaViewer from './ImagePanoramaViewer.svelte';
+   import OcrButton from './OcrButton.svelte';
+   import PhotoViewer from './PhotoViewer.svelte';
++  import SensitiveOverlay from './SensitiveOverlay.svelte';
+   import SlideshowBar from './SlideshowBar.svelte';
+   import SlideshowMetadataOverlay from './SlideshowMetadataOverlay.svelte';
+   import VideoViewer from './VideoWrapperViewer.svelte';
+@@ -430,6 +432,9 @@
+     lastCursor = cursor;
+   });
+ 
++  // Set by SensitiveOverlay: a hidden sensitive video is not loaded, since the server refuses it.
++  let sensitiveHidden = $state(false);
++
+   const viewerKind = $derived.by(() => {
+     if (previewStackedAsset) {
+       return previewStackedAsset.type === AssetTypeEnum.Image ? 'PhotoViewer' : 'StackVideoViewer';
+@@ -554,7 +559,13 @@
+ 
+   <!-- Asset Viewer -->
+   <div data-viewer-content class="relative z-[-1] col-span-4 col-start-1 row-span-full row-start-1">
+-    {#if viewerKind === 'StackVideoViewer'}
++    {#if sensitiveHidden && viewerKind.endsWith('VideoViewer')}
++      <img
++        src={getAssetMediaUrl({ id: asset.id, size: AssetMediaSize.Preview, cacheKey: asset.thumbhash })}
++        alt=""
++        class="size-full object-contain"
++      />
++    {:else if viewerKind === 'StackVideoViewer'}
+       <VideoViewer
+         asset={previewStackedAsset!}
+         cacheKey={previewStackedAsset!.thumbhash}
+@@ -601,6 +612,8 @@
+       />
+     {/if}
+ 
++    <SensitiveOverlay assetId={asset.id} onHiddenChange={(hidden) => (sensitiveHidden = hidden)} />
++
+     {#if showActivityStatus}
+       <div class="absolute inset-e-0 bottom-0 me-8 mb-20">
+         <ActivityStatus
+diff --git a/web/src/lib/components/asset-viewer/SensitiveOverlay.svelte b/web/src/lib/components/asset-viewer/SensitiveOverlay.svelte
+new file mode 100644
+index 0000000..534e884
+--- /dev/null
++++ b/web/src/lib/components/asset-viewer/SensitiveOverlay.svelte
+@@ -0,0 +1,83 @@
++<script lang="ts">
++  // Sensitive content: an asset carrying the server's sensitive tag (IMMICH_SENSITIVE_TAG, "Sensitive"
++  // by default, or a tag under it) is served blurred until the session is unlocked with the PIN, the
++  // same unlock as the Locked Folder. This offers that unlock, and the way to hide it all again.
++  import { page } from '$app/state';
++  import { authManager } from '$lib/managers/auth-manager.svelte';
++  import { Route } from '$lib/route';
++  import { lockAuthSession } from '@immich/sdk';
++  import { Button, Icon } from '@immich/ui';
++  import { mdiEyeOff, mdiEyeOffOutline } from '@mdi/js';
++
++  interface Props {
++    assetId: string;
++    onHiddenChange?: (hidden: boolean) => void;
++  }
++
++  const { assetId, onHiddenChange }: Props = $props();
++
++  let sensitive = $state(false);
++  let hidden = $state(false);
++
++  $effect(() => {
++    const id = assetId;
++    sensitive = false;
++    hidden = false;
++    onHiddenChange?.(false);
++    // authManager.params carries a shared link's key, as the media URLs do.
++    const params = Object.entries(authManager.params)
++      .filter(([, value]) => value)
++      .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
++      .join('&');
++    const controller = new AbortController();
++    fetch(`/api/assets/${id}/sensitive?${params}`, { signal: controller.signal })
++      .then((response) => (response.ok ? response.json() : undefined))
++      .then((body?: { sensitive: boolean; hidden: boolean }) => {
++        sensitive = !!body?.sensitive;
++        hidden = sensitive && !!body?.hidden;
++        onHiddenChange?.(hidden);
++      })
++      .catch(() => {});
++    return () => controller.abort();
++  });
++
++  // A full load afterwards, so every blurred image already on the page is fetched again.
++  const unlock = () => {
++    location.assign(Route.pinPrompt({ continue: page.url.pathname + page.url.search }));
++  };
++
++  const hideAgain = async () => {
++    try {
++      await lockAuthSession();
++    } finally {
++      location.reload();
++    }
++  };
++</script>
++
++{#if hidden}
++  <div class="absolute inset-0 z-10 flex items-center justify-center">
++    <div class="flex flex-col items-center gap-3 rounded-2xl bg-black/60 px-8 py-6 text-center text-white">
++      <Icon icon={mdiEyeOff} size="48" />
++      <p class="text-lg font-medium">Sensitive content</p>
++      {#if authManager.isSharedLink}
++        <p class="max-w-64 text-sm text-white/80">Hidden on shared links.</p>
++      {:else}
++        <p class="max-w-64 text-sm text-white/80">Hidden until you enter your PIN.</p>
++        <Button size="small" onclick={unlock}>Show</Button>
++      {/if}
++    </div>
++  </div>
++{:else if sensitive && !authManager.isSharedLink}
++  <div class="absolute inset-s-4 bottom-24 z-10">
++    <button
++      type="button"
++      class="flex items-center gap-1.5 rounded-full bg-black/60 px-3 py-1.5 text-xs text-white hover:bg-black/80"
++      title="Sensitive content is showing because this session is unlocked. Lock it to hide it again."
++      onclick={hideAgain}
++    >
++      <Icon icon={mdiEyeOffOutline} size="14" />
++      Sensitive · hide again
++    </button>
++  </div>
++{/if}
+diff --git a/web/src/routes/(user)/people/[personId]/[[photos=photos]]/[[assetId=id]]/+page.svelte b/web/src/routes/(user)/people/[personId]/[[photos=photos]]/[[assetId=id]]/+page.svelte
+index ab749a4..df74564 100644
+--- a/web/src/routes/(user)/people/[personId]/[[photos=photos]]/[[assetId=id]]/+page.svelte
++++ b/web/src/routes/(user)/people/[personId]/[[photos=photos]]/[[assetId=id]]/+page.svelte
+@@ -52,6 +52,8 @@
+     mdiArrowLeft,
+     mdiDotsVertical,
+     mdiPencilOutline,
++    mdiShieldLockOpenOutline,
++    mdiShieldLockOutline,
+   } from '@mdi/js';
+   import { DateTime } from 'luxon';
+   import { onMount } from 'svelte';
+@@ -310,6 +312,49 @@
+   };
+ 
+   const { Edit, Favorite, Unfavorite, HidePerson, ShowPerson, Access } = $derived(getPersonActions($t, person));
++  // Sensitive people: every photo and video showing them is blurred until the PIN is entered.
++  let sensitivePerson = $state<{ sensitive: boolean; hidden: boolean; available: boolean }>();
++  $effect(() => {
++    const id = person.id;
++    sensitivePerson = undefined;
++    fetch(`/api/people/${id}/sensitive`)
++      .then((response) => (response.ok ? response.json() : undefined))
++      .then((body) => (sensitivePerson = body))
++      .catch(() => {});
++  });
++
++  const setPersonSensitive = async (sensitive: boolean) => {
++    const response = await fetch(`/api/people/${person.id}/sensitive`, {
++      method: 'PUT',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ sensitive }),
++    });
++    if (response.status === 401 && !sensitive) {
++      // Showing them again takes the PIN, like viewing them.
++      location.assign(Route.pinPrompt({ continue: $page.url.pathname }));
++      return;
++    }
++    if (!response.ok) {
++      handleError(new Error(await response.text()), 'Could not change whether this person is hidden');
++      return;
++    }
++    location.reload();
++  };
++
++  const HideBehindPin: ActionItem = {
++    title: 'Hide behind PIN',
++    icon: mdiShieldLockOutline,
++    $if: () => !!sensitivePerson?.available && !sensitivePerson.sensitive,
++    onAction: () => setPersonSensitive(true),
++  };
++
++  const StopHidingBehindPin: ActionItem = {
++    title: 'Stop hiding behind PIN',
++    icon: mdiShieldLockOpenOutline,
++    $if: () => !!sensitivePerson?.sensitive,
++    onAction: () => setPersonSensitive(false),
++  };
++
+   const SelectFeaturePhoto: ActionItem = {
+     title: $t('select_featured_photo'),
+     icon: mdiAccountBoxOutline,
+@@ -518,7 +563,17 @@
+         {#snippet trailing()}
+           <ActionButton action={Access} />
+           <ContextMenuButton
+-            items={[SelectFeaturePhoto, Edit, HidePerson, ShowPerson, Merge, Favorite, Unfavorite]}
++            items={[
++              SelectFeaturePhoto,
++              Edit,
++              HidePerson,
++              ShowPerson,
++              HideBehindPin,
++              StopHidingBehindPin,
++              Merge,
++              Favorite,
++              Unfavorite,
++            ]}
+             aria-label={$t('open')}
+           />
+         {/snippet}
+-- 
+2.56.0
+

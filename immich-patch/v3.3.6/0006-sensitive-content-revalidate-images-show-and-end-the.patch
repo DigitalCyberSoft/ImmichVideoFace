@@ -1,0 +1,277 @@
+From 231dcdcf6a1fbf624b591acf92f756fc2d1768e8 Mon Sep 17 00:00:00 2001
+From: DCS <claude@dcs.io>
+Date: Thu, 5 Nov 2026 01:01:55 -0800
+Subject: [PATCH 6/6] sensitive content: revalidate images, show and end the
+ unlock
+
+Images (thumbnails, previews, originals) are now always revalidated by ETag
+instead of reused from the browser cache for a day, so a tag added later, a
+person hidden or a session locked takes effect at once. Thumbnail URLs gain
+s=1 once, so images cached before this are fetched again. While the session
+is unlocked with the PIN, the top bar shows an unlocked padlock that locks
+it again.
+---
+ .../src/services/asset-media.service.spec.ts  | 26 ++++-----
+ server/src/services/asset-media.service.ts    | 11 +++-
+ .../navigation-bar/NavigationBar.svelte       |  3 ++
+ .../navigation-bar/SensitiveLockButton.svelte | 54 +++++++++++++++++++
+ web/src/lib/utils.ts                          |  4 +-
+ 5 files changed, 82 insertions(+), 16 deletions(-)
+ create mode 100644 web/src/lib/components/shared-components/navigation-bar/SensitiveLockButton.svelte
+
+diff --git a/server/src/services/asset-media.service.spec.ts b/server/src/services/asset-media.service.spec.ts
+index 363b69e..ee8fe90 100644
+--- a/server/src/services/asset-media.service.spec.ts
++++ b/server/src/services/asset-media.service.spec.ts
+@@ -493,7 +493,7 @@ describe(AssetMediaService.name, () => {
+           path: asset.originalPath,
+           fileName: asset.originalFileName,
+           contentType: 'image/jpeg',
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+         }),
+       );
+     });
+@@ -513,7 +513,7 @@ describe(AssetMediaService.name, () => {
+           path: editedAsset.files[3].path,
+           fileName: editedAsset.originalFileName,
+           contentType: 'image/jpeg',
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+         }),
+       );
+     });
+@@ -533,7 +533,7 @@ describe(AssetMediaService.name, () => {
+           path: editedAsset.files[3].path,
+           fileName: editedAsset.originalFileName,
+           contentType: 'image/jpeg',
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+         }),
+       );
+     });
+@@ -552,7 +552,7 @@ describe(AssetMediaService.name, () => {
+           path: fullsizeEdited.path,
+           fileName: editedAsset.originalFileName,
+           contentType: 'image/jpeg',
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+         }),
+       );
+     });
+@@ -572,7 +572,7 @@ describe(AssetMediaService.name, () => {
+           path: editedAsset.originalPath,
+           fileName: editedAsset.originalFileName,
+           contentType: 'image/jpeg',
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+         }),
+       );
+     });
+@@ -595,7 +595,7 @@ describe(AssetMediaService.name, () => {
+       await expect(sut.viewThumbnail(authStub.admin, asset.id, { size: AssetMediaSize.THUMBNAIL })).resolves.toEqual(
+         new ImmichFileResponse({
+           path: asset.files[0].path,
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+           contentType: 'image/jpeg',
+           fileName: `IMG_${asset.id}_thumbnail.jpg`,
+         }),
+@@ -609,7 +609,7 @@ describe(AssetMediaService.name, () => {
+       await expect(sut.viewThumbnail(authStub.admin, asset.id, { size: AssetMediaSize.PREVIEW })).resolves.toEqual(
+         new ImmichFileResponse({
+           path: asset.files[0].path,
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+           contentType: 'image/jpeg',
+           fileName: `IMG_${asset.id}_preview.jpg`,
+         }),
+@@ -625,7 +625,7 @@ describe(AssetMediaService.name, () => {
+       await expect(sut.viewThumbnail(authStub.admin, asset.id, { size: AssetMediaSize.THUMBNAIL })).resolves.toEqual(
+         new ImmichFileResponse({
+           path: asset.files[0].path,
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+           contentType: 'application/octet-stream',
+           fileName: `IMG_${asset.id}_thumbnail.ext`,
+         }),
+@@ -640,7 +640,7 @@ describe(AssetMediaService.name, () => {
+       await expect(sut.viewThumbnail(authStub.admin, asset.id, { size: AssetMediaSize.THUMBNAIL })).resolves.toEqual(
+         new ImmichFileResponse({
+           path: asset.files[0].path,
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+           contentType: 'image/jpeg',
+           fileName: `IMG_${asset.id}_thumbnail.jpg`,
+         }),
+@@ -657,7 +657,7 @@ describe(AssetMediaService.name, () => {
+       ).resolves.toEqual(
+         new ImmichFileResponse({
+           path: asset.files[0].path,
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+           contentType: 'image/jpeg',
+           fileName: `IMG_${asset.id}_thumbnail.jpg`,
+         }),
+@@ -674,7 +674,7 @@ describe(AssetMediaService.name, () => {
+       ).resolves.toEqual(
+         new ImmichFileResponse({
+           path: asset.files[0].path,
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+           contentType: 'image/jpeg',
+           fileName: `IMG_${asset.id}_thumbnail.jpg`,
+         }),
+@@ -694,7 +694,7 @@ describe(AssetMediaService.name, () => {
+       ).resolves.toEqual(
+         new ImmichFileResponse({
+           path: asset.files[0].path,
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+           contentType: 'image/jpeg',
+           fileName: `IMG_${asset.id}_thumbnail.jpg`,
+         }),
+@@ -713,7 +713,7 @@ describe(AssetMediaService.name, () => {
+       await expect(sut.viewThumbnail(auth, asset.id, { size: AssetMediaSize.PREVIEW })).resolves.toEqual(
+         new ImmichFileResponse({
+           path: asset.files[0].path,
+-          cacheControl: CacheControl.PrivateWithCache,
++          cacheControl: CacheControl.PrivateWithoutCache,
+           contentType: 'image/jpeg',
+           fileName: `${asset.id}_preview.jpg`,
+         }),
+diff --git a/server/src/services/asset-media.service.ts b/server/src/services/asset-media.service.ts
+index f5b6818..7ab232a 100644
+--- a/server/src/services/asset-media.service.ts
++++ b/server/src/services/asset-media.service.ts
+@@ -48,6 +48,13 @@ export interface AssetMediaRedirectResponse {
+   targetSize: AssetMediaSize | 'original';
+ }
+ 
++/**
++ * Images are always revalidated with the server (cheaply, by ETag), never reused from a
++ * browser cache unasked: whether an asset is sensitive can change at any time (a tag
++ * added, a person hidden, the session locked), and a cached copy would show it anyway.
++ */
++const SENSITIVE_IMAGE_CACHE = CacheControl.PrivateWithoutCache;
++
+ @Injectable()
+ export class AssetMediaService extends BaseService {
+   async getUploadAssetIdByChecksum(auth: AuthDto, checksum?: string): Promise<AssetMediaResponseDto | undefined> {
+@@ -257,7 +264,7 @@ export class AssetMediaService extends BaseService {
+       path,
+       fileName: getFileNameWithoutExtension(originalFileName) + getFilenameExtension(path),
+       contentType: mimeTypes.lookup(path),
+-      cacheControl: sensitiveCacheControl(sensitive, CacheControl.PrivateWithCache),
++      cacheControl: SENSITIVE_IMAGE_CACHE,
+     });
+   }
+ 
+@@ -311,7 +318,7 @@ export class AssetMediaService extends BaseService {
+       fileName,
+       path,
+       contentType: mimeTypes.lookup(path),
+-      cacheControl: sensitiveCacheControl(sensitive, CacheControl.PrivateWithCache),
++      cacheControl: SENSITIVE_IMAGE_CACHE,
+     });
+   }
+ 
+diff --git a/web/src/lib/components/shared-components/navigation-bar/NavigationBar.svelte b/web/src/lib/components/shared-components/navigation-bar/NavigationBar.svelte
+index ac7c30d..490e299 100644
+--- a/web/src/lib/components/shared-components/navigation-bar/NavigationBar.svelte
++++ b/web/src/lib/components/shared-components/navigation-bar/NavigationBar.svelte
+@@ -6,6 +6,7 @@
+   import { page } from '$app/state';
+   import { clickOutside } from '$lib/actions/click-outside';
+   import NotificationPanel from '$lib/components/shared-components/navigation-bar/NotificationPanel.svelte';
++  import SensitiveLockButton from '$lib/components/shared-components/navigation-bar/SensitiveLockButton.svelte';
+   import SearchBar from '$lib/components/shared-components/search-bar/SearchBar.svelte';
+   import SkipLink from '$lib/elements/SkipLink.svelte';
+   import { authManager } from '$lib/managers/auth-manager.svelte';
+@@ -125,6 +126,8 @@
+           />
+         {/if}
+ 
++        <SensitiveLockButton />
++
+         <ThemeButton />
+ 
+         <div
+diff --git a/web/src/lib/components/shared-components/navigation-bar/SensitiveLockButton.svelte b/web/src/lib/components/shared-components/navigation-bar/SensitiveLockButton.svelte
+new file mode 100644
+index 0000000..db60f3a
+--- /dev/null
++++ b/web/src/lib/components/shared-components/navigation-bar/SensitiveLockButton.svelte
+@@ -0,0 +1,54 @@
++<script lang="ts">
++  // Sensitive content: while the session is unlocked with the PIN, everything hidden behind
++  // it shows. This says so, and locks it again. Checked on each navigation and every minute.
++  import { afterNavigate } from '$app/navigation';
++  import { authManager } from '$lib/managers/auth-manager.svelte';
++  import { getAuthStatus, lockAuthSession } from '@immich/sdk';
++  import { IconButton } from '@immich/ui';
++  import { mdiLockOpenVariantOutline } from '@mdi/js';
++  import { onDestroy, onMount } from 'svelte';
++
++  let unlocked = $state(false);
++
++  const check = async () => {
++    if (!authManager.authenticated || authManager.isSharedLink) {
++      unlocked = false;
++      return;
++    }
++    try {
++      const status = await getAuthStatus();
++      unlocked = status.isElevated;
++    } catch {
++      unlocked = false;
++    }
++  };
++
++  const lock = async () => {
++    try {
++      await lockAuthSession();
++    } finally {
++      location.reload();
++    }
++  };
++
++  let timer: ReturnType<typeof setInterval> | undefined;
++  onMount(() => {
++    void check();
++    timer = setInterval(() => void check(), 60_000);
++  });
++  onDestroy(() => clearInterval(timer));
++  afterNavigate(() => void check());
++</script>
++
++{#if unlocked}
++  <IconButton
++    shape="round"
++    color="danger"
++    variant="ghost"
++    size="medium"
++    icon={mdiLockOpenVariantOutline}
++    title="Sensitive content is showing (unlocked with your PIN). Click to hide it again."
++    aria-label="Hide sensitive content"
++    onclick={lock}
++  />
++{/if}
+diff --git a/web/src/lib/utils.ts b/web/src/lib/utils.ts
+index c49ba30..a40ef6f 100644
+--- a/web/src/lib/utils.ts
++++ b/web/src/lib/utils.ts
+@@ -235,7 +235,9 @@ export const getAssetMediaUrl = (options: AssetUrlOptions) => {
+   const { id, size, cacheKey: c, edited = true } = options;
+   const isOriginal = size === AssetMediaSize.Original;
+   const path = isOriginal ? getAssetOriginalPath(id) : getAssetThumbnailPath(id);
+-  return createUrl(path, { ...authManager.params, size: isOriginal ? undefined : size, c, edited });
++  // `s` changed once so browsers drop images cached before sensitive content was hidden;
++  // the server has them revalidated since (see the sensitive content patch).
++  return createUrl(path, { ...authManager.params, size: isOriginal ? undefined : size, c, edited, s: 1 });
+ };
+ 
+ export const getAssetPlaybackUrl = (options: AssetUrlOptions) => {
+-- 
+2.56.0
+
