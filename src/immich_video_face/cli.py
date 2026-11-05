@@ -653,6 +653,95 @@ def reembed(
 
 
 @app.command()
+def sensitive(
+    config: Optional[Path] = _config_option,
+    apply: bool = typer.Option(False, "--apply", help="Make the changes, not just list them"),
+    top: int = typer.Option(0, "--top", help="Also list the N highest-scoring assets per category"),
+    verbose: bool = False,
+) -> None:
+    """Flag sensitive content with tags, from the search embeddings Immich already has.
+
+    Scores every photo, and every indexed video by its frames, against the
+    categories in [sensitive] flag, and tags what passes <tag>/<category>. A
+    patched Immich then serves anything under <tag> blurred until the PIN is
+    entered. Lists the changes unless --apply is given.
+    """
+    from .immich_api import ImmichClient
+    from .immich_db import ImmichDb
+    from .sensitive import apply_plan, cover_face_fixes, plan_category, sensitive_assets
+    from .state import State
+
+    cfg = _setup(config, verbose)
+    settings = cfg.sensitive
+    if not settings.enabled:
+        console.print("[red]Set [sensitive] enabled = true first.[/red]")
+        raise typer.Exit(1)
+    client = ImmichClient(cfg)
+    clip = client.clip_model()
+    if clip is not None and clip != cfg.objects.model:
+        console.print(
+            f"[red]Search model mismatch:[/red] Immich uses [bold]{clip}[/bold], "
+            f"objects.model is [bold]{cfg.objects.model}[/bold]; scores would be meaningless."
+        )
+        raise typer.Exit(1)
+
+    with ImmichDb(cfg) as db, State(cfg.state_db) as state:
+        owner = _owner_id(cfg, client)
+        categories = sorted(set(settings.flag) | state.sensitive_categories())
+        plans = [
+            plan_category(db._conn, state, cfg, owner, name, name in settings.flag)
+            for name in categories
+        ]
+
+        table = Table(title="Sensitive content" + ("" if apply else " (dry run)"))
+        for column in ("tag", "flagged", "scored", "passing", "tagged", "to tag", "to untag", "untagged by hand"):
+            table.add_column(column, justify="left" if column == "tag" else "right")
+        for plan in plans:
+            table.add_row(
+                plan.tag_name,
+                "yes" if plan.category in settings.flag else "no",
+                str(plan.scored),
+                str(len(plan.passing)),
+                str(plan.already),
+                str(len(plan.to_tag)),
+                str(len(plan.to_untag)),
+                str(len(plan.cleared_by_hand)),
+            )
+        console.print(table)
+
+        if top:
+            base = cfg.immich.browse_url.rstrip("/")
+            for plan in plans:
+                if not plan.scores:
+                    continue
+                console.print(
+                    f"\n[bold]{plan.tag_name}[/bold] highest scores "
+                    "(how far past the cut-offs; flagged at 0 or more):"
+                )
+                for asset_id, score in sorted(plan.scores.items(), key=lambda kv: -kv[1])[:top]:
+                    mark = "flag" if score >= 0 else "    "
+                    console.print(f"  {mark} {score:+.3f}  {base}/photos/{asset_id}")
+
+        if apply:
+            for plan in plans:
+                apply_plan(client, state, plan)
+
+        if settings.fix_cover_faces:
+            fixes = cover_face_fixes(db, owner, sensitive_assets(db._conn, owner, settings.tag))
+            for person_id, name, asset_id in fixes:
+                if apply:
+                    client.set_person_cover(person_id, asset_id)
+            if fixes:
+                verb = "moved" if apply else "would move"
+                console.print(
+                    f"{verb} the cover photo of {len(fixes)} person(s) off sensitive assets"
+                )
+        if not apply:
+            console.print("Nothing changed; run with [bold]--apply[/bold] to make these changes.")
+    client.close()
+
+
+@app.command()
 def commit(
     config: Optional[Path] = _config_option,
     run: Optional[int] = typer.Option(None, "--run", help="Run id to commit"),

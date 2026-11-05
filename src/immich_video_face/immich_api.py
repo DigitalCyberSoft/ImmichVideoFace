@@ -229,6 +229,10 @@ class ImmichClient:
         payload = self._request("GET", f"/people/{person_id}/statistics").json()
         return int(payload.get("assets", 0))
 
+    def set_person_cover(self, person_id: str, asset_id: str) -> None:
+        """Make the person's face on `asset_id` their cover photo."""
+        self._request("PUT", f"/people/{person_id}", json={"featureFaceAssetId": asset_id})
+
     # ---- tags -----------------------------------------------------------
 
     def upsert_tag(self, name: str) -> str:

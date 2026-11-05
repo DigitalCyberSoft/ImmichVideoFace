@@ -143,6 +143,16 @@ CREATE TABLE IF NOT EXISTS tagged_assets (
     created_at    REAL NOT NULL,
     PRIMARY KEY (run_id, asset_id, tag_id)
 );
+-- Sensitive-content tags this tool put on (see sensitive.py). cleared_at is set
+-- when someone took the tag off by hand, so it is never put back.
+CREATE TABLE IF NOT EXISTS sensitive_tags (
+    category      TEXT NOT NULL,
+    asset_id      TEXT NOT NULL,
+    tag_id        TEXT NOT NULL,
+    tagged_at     REAL NOT NULL,
+    cleared_at    REAL,
+    PRIMARY KEY (category, asset_id)
+);
 """
 
 
@@ -243,6 +253,42 @@ class State:
                 DROP TABLE tagged_assets_old;
                 """
             )
+
+    # ---- sensitive content ---------------------------------------------
+
+    def sensitive_tagged(self, category: str) -> dict[str, bool]:
+        """{asset id: cleared by hand?} for tags this tool put on in `category`."""
+        rows = self._conn.execute(
+            "SELECT asset_id, cleared_at FROM sensitive_tags WHERE category = ?", (category,)
+        )
+        return {row["asset_id"]: row["cleared_at"] is not None for row in rows}
+
+    def sensitive_categories(self) -> set[str]:
+        rows = self._conn.execute("SELECT DISTINCT category FROM sensitive_tags")
+        return {row["category"] for row in rows}
+
+    def sensitive_record(self, category: str, asset_ids: list[str], tag_id: str) -> None:
+        now = time.time()
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO sensitive_tags (category, asset_id, tag_id, tagged_at) "
+            "VALUES (?, ?, ?, ?)",
+            [(category, asset_id, tag_id, now) for asset_id in asset_ids],
+        )
+        self._conn.commit()
+
+    def sensitive_mark_cleared(self, category: str, asset_id: str) -> None:
+        self._conn.execute(
+            "UPDATE sensitive_tags SET cleared_at = ? WHERE category = ? AND asset_id = ?",
+            (time.time(), category, asset_id),
+        )
+        self._conn.commit()
+
+    def sensitive_forget(self, category: str, asset_ids: list[str]) -> None:
+        self._conn.executemany(
+            "DELETE FROM sensitive_tags WHERE category = ? AND asset_id = ?",
+            [(category, asset_id) for asset_id in asset_ids],
+        )
+        self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()

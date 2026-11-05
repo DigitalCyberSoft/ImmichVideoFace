@@ -7,6 +7,7 @@ which this tool's database role owns:
     <schema>.frame_embedding  one CLIP vector per sampled frame, for object search
     <schema>.appearance       when each person is on screen in a video
     <schema>.video            what was indexed, with which settings
+    <schema>.sensitive_person people a patched Immich hides until the PIN is entered
 
 Immich's own tables are still never written; faces and people go through the
 REST API as before. Stock Immich ignores this schema. A build carrying the
@@ -18,6 +19,10 @@ Setup (once, as a Postgres superuser), with `ivf` the role in `[db] user`:
     CREATE SCHEMA ivf AUTHORIZATION ivf;
     GRANT USAGE ON SCHEMA ivf TO immich;   -- the role Immich connects as
     ALTER DEFAULT PRIVILEGES FOR ROLE ivf IN SCHEMA ivf GRANT SELECT ON TABLES TO immich;
+
+and, once the tables exist, so people can be hidden behind the PIN from Immich:
+
+    GRANT INSERT, DELETE ON ivf.sensitive_person TO immich;
 
 The tables themselves are created on first use.
 """
@@ -59,6 +64,14 @@ CREATE TABLE IF NOT EXISTS {schema}.appearance (
     PRIMARY KEY (asset_id, person_id)
 );
 CREATE INDEX IF NOT EXISTS appearance_face_id ON {schema}.appearance (face_id);
+-- People whose every photo and video a patched Immich hides until the PIN is entered.
+-- Written by Immich itself (PUT /api/people/:id/sensitive), so its role needs
+-- INSERT and DELETE here: see the setup note at the top of this module.
+CREATE TABLE IF NOT EXISTS {schema}.sensitive_person (
+    person_group_id uuid PRIMARY KEY,
+    owner_id        uuid NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS {schema}.video (
     asset_id     uuid PRIMARY KEY,
     duration_ms  integer,

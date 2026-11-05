@@ -93,6 +93,37 @@ Stock Immich ignores the `ivf` schema. A build with the companion patch reads it
 The patch is in [`immich-patch/`](immich-patch/), one directory per Immich release it was
 made for. Nothing else here needs it.
 
+### Sensitive content behind the PIN
+
+`ivf sensitive` flags content with tags, from embeddings Immich already has: each photo's
+smart search embedding and each indexed video's sampled frames. Only the category prompts
+go through the model, and the scoring is one query in Postgres (about 50 s for 16k photos
+and 37k frames). It lists what it would change; `--apply` makes the changes, and `--top N`
+lists the highest scores with links.
+
+- **Categories** are text the search model compares images with: `Explicit` (the default
+  `flag`), `Nudity` and `Underwear`, each a set of `prompts`, a set of look-alikes that
+  should stay visible (`contrast`), and two cut-offs. An image is flagged when its nearest
+  prompt reaches `min_similarity` and beats its nearest look-alike by `min_margin`; a video
+  when `min_frames` of its sampled frames do (2 by default). Any field can be overridden
+  in `[sensitive.categories.<name>]`, and new categories added.
+- **Measured** on 40 public Wikimedia Commons images per group, with
+  ViT-SO400M-16-SigLIP2-384: `Explicit` flags 95% of explicit images, 8% of lingerie and
+  none of the bikini, topless beach, nude, nude art, breastfeeding or ordinary photos.
+  Other search models need their own cut-offs.
+- **Tags** are `<tag>/<category>` (`Sensitive/Explicit`). A tag removed by hand is never
+  put back, a tag added by hand is never touched, and the tool's own tags come off again
+  when a category stops being flagged or an asset stops passing.
+- **Cover photos**: a person whose cover face is on a sensitive asset gets their largest
+  face on another asset instead.
+
+The companion patch (from `v3.3.5+dcs2`) hides anything tagged under `Sensitive`
+(`IMMICH_SENSITIVE_TAG`), and every asset showing a person marked "Hide behind PIN" on
+their page, until the session is unlocked with the user's PIN, the same unlock as the
+Locked Folder. Such assets stay in the timeline, search and albums, served as a blurred
+placeholder; their video and original are refused. Immich writes the hidden people to
+`ivf.sensitive_person`, so its role needs `GRANT INSERT, DELETE` there.
+
 ### Running without Docker
 
 ```toml

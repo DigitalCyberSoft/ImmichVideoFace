@@ -12,7 +12,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 DEFAULT_CONFIG_PATHS = (
     Path("config.toml"),
@@ -200,6 +200,118 @@ class IndexSettings(BaseModel):
     schema_name: str = "ivf"
 
 
+class SensitiveCategory(BaseModel):
+    """One kind of content to flag, as text the search model can compare images with.
+
+    Two cosine similarities, from Immich's own smart search embedding: to the
+    nearest of `prompts`, and to the nearest of `contrast` (what is easily
+    confused with the category but should stay visible). An image is flagged when
+    the first reaches `min_similarity` and leads the second by `min_margin`; a
+    video when one sampled frame does. The defaults were measured on public test
+    images with ViT-SO400M-16-SigLIP2-384; other models need their own.
+    """
+
+    prompts: list[str]
+    contrast: list[str]
+    min_similarity: float = 0.12
+    min_margin: float = 0.0
+    # A video needs this many sampled frames to pass (all of them, if it has fewer):
+    # one stray frame of a long video is more often a misreading than the real thing.
+    min_frames: int = 2
+
+
+_EVERYDAY = [
+    "a photo of a couple", "a portrait of a person", "a group of people", "a family photo",
+    "a landscape", "a photo of food", "a child playing", "a selfie",
+]
+# Everyday scenes that phone video frames (blurred, close up) can resemble.
+_LOOKALIKES = [
+    "a person eating", "a baby drinking from a bottle", "a baby with a pacifier",
+    "a close-up of a face", "a child in the bath", "a baby being changed", "a person in bed",
+    "people hugging",
+]
+
+
+def _default_categories() -> dict[str, SensitiveCategory]:
+    return {
+        "Explicit": SensitiveCategory(
+            prompts=[
+                "a photo of people having sex", "pornography", "an explicit sexual photo",
+                "a photo of exposed genitals", "a photo of oral sex",
+                "a photo of a person masturbating",
+            ],
+            contrast=[
+                "a photo of a nude person", "a topless woman at the beach", "a woman in lingerie",
+                "a person in a bikini", "a nude statue", "a painting of a nude",
+                "a mother breastfeeding a baby", *_EVERYDAY, *_LOOKALIKES,
+            ],
+            # 95% of explicit test images; 8% of lingerie, nothing else.
+            min_similarity=0.119,
+            min_margin=-0.01,
+        ),
+        "Nudity": SensitiveCategory(
+            prompts=[
+                "a photo of a nude person", "a topless woman", "a photo of exposed breasts",
+                "a photo of people having sex", "pornography",
+            ],
+            contrast=[
+                "a woman in lingerie", "a person in a bikini", "a shirtless man",
+                "a nude statue", "a painting of a nude", *_EVERYDAY, *_LOOKALIKES,
+            ],
+            # 98% of nude and 45% of topless test images; 15% of breastfeeding,
+            # 8% of lingerie. Pair it with Explicit, which it only partly covers.
+            min_similarity=0.11,
+            min_margin=0.0,
+        ),
+        "Underwear": SensitiveCategory(
+            prompts=["a woman in lingerie", "a person in underwear", "a woman in a bra"],
+            contrast=["a person in a bikini", "a person in a swimsuit", *_EVERYDAY],
+            # 68% of lingerie test images; 2% of bikini, 22% of nude.
+            min_similarity=0.08,
+            min_margin=0.01,
+        ),
+    }
+
+
+class SensitiveSettings(BaseModel):
+    """Flag sensitive content with a tag, for a patched Immich to hide behind the PIN.
+
+    `ivf sensitive` scores every photo, and every video by its sampled frames,
+    against each category in `flag`, and tags what passes `<tag>/<category>`.
+    A tag removed by hand is never put back, and a manual tag is never touched.
+    """
+
+    enabled: bool = False
+    # MUST match the server's IMMICH_SENSITIVE_TAG; anything tagged under it is hidden.
+    tag: str = "Sensitive"
+    flag: list[str] = Field(default_factory=lambda: ["Explicit"])
+    categories: dict[str, SensitiveCategory] = Field(default_factory=_default_categories)
+    # Make sure no person's cover photo comes from a sensitive asset.
+    fix_cover_faces: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_default_categories(cls, data):
+        """A category set in the config file changes only the fields it names, so
+        `[sensitive.categories.Explicit] min_margin = 0.02` keeps the prompts."""
+        if isinstance(data, dict) and data.get("categories"):
+            merged = {name: c.model_dump() for name, c in _default_categories().items()}
+            for name, override in data["categories"].items():
+                merged[name] = {**merged.get(name, {}), **dict(override)}
+            data = {**data, "categories": merged}
+        return data
+
+    @model_validator(mode="after")
+    def _known_flags(self):
+        unknown = [name for name in self.flag if name not in self.categories]
+        if unknown:
+            raise ValueError(
+                f"sensitive.flag names unknown categories {unknown}; "
+                f"known: {sorted(self.categories)}"
+            )
+        return self
+
+
 class ClusterSettings(BaseModel):
     # Cosine distance between two views of the *same* face across a video --
     # different angles, motion blur and lighting -- routinely exceeds 0.4.
@@ -255,6 +367,7 @@ class Config(BaseModel):
     objects: ObjectSettings = Field(default_factory=ObjectSettings)
     timeline: TimelineSettings = Field(default_factory=TimelineSettings)
     index: IndexSettings = Field(default_factory=IndexSettings)
+    sensitive: SensitiveSettings = Field(default_factory=SensitiveSettings)
 
     state_db: Path = Path("ivf-state.sqlite3")
     report_dir: Path = Path("reports")
