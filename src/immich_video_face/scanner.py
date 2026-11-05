@@ -56,7 +56,23 @@ class Scanner:
         self.detector = detector
         self.matcher = matcher
 
-    def scan(self, asset: VideoAsset, keep_crops: bool = False) -> ScanResult:
+    def clip_every(self) -> int:
+        """Every how many sampled frames one also gets a CLIP embedding (0: none)."""
+        if not self.detector.clip_model:
+            return 0
+        fps = max(self.config.sampling.min_fps, 0.1)
+        return max(1, round(self.config.objects.interval_s * fps))
+
+    def clip_spacing_s(self) -> float:
+        """Seconds of video between two frames embedded for search."""
+        return self.clip_every() / max(self.config.sampling.min_fps, 0.1)
+
+    def scan(self, asset: VideoAsset, keep_crops: bool = False, clip: bool = True) -> ScanResult:
+        """Decode, detect, cluster and match one video.
+
+        `clip=False` skips the search embeddings, for a rescan that keeps the
+        frames already indexed (they cost far more than faces on a CPU).
+        """
         path = self.config.paths.to_host(asset.original_path)
         result = ScanResult(asset=asset, path=path)
 
@@ -78,10 +94,7 @@ class Scanner:
         # Object search: every `clip_every`-th sampled frame also gets a CLIP
         # embedding. Not for a Live Photo's motion clip -- it is hidden, so search
         # could never return it, and the still beside it has its own embedding.
-        clip_every = 0
-        if self.detector.clip_model and not asset.still_asset_id:
-            fps = max(self.config.sampling.min_fps, 0.1)
-            clip_every = max(1, round(self.config.objects.interval_s * fps))
+        clip_every = self.clip_every() if clip and not asset.still_asset_id else 0
 
         observations: list[Observation] = []
         clip_vectors: list[tuple[int, np.ndarray]] = []
@@ -188,8 +201,7 @@ class Scanner:
             result.error = str(exc)
             return result
         result.duration_s = info.duration_s
-        fps = max(self.config.sampling.min_fps, 0.1)
-        clip_every = max(1, round(self.config.objects.interval_s * fps))
+        clip_every = max(1, self.clip_every())
         # Only every clip_every-th frame is sent; the rest are decoded and dropped.
         vectors: list[tuple[int, np.ndarray]] = []
         try:

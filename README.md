@@ -75,6 +75,11 @@ database role owns. Immich's tables are still never written directly.
   nothing is rescanned or reviewed. Search ignores frames from any other model in the
   meantime. The model is not part of the scan fingerprint; fingerprints recorded when it
   was are carried over automatically.
+- **Rescans keep search frames.** When a video is scanned again and its indexed frames are
+  all from the current `objects.model` and spaced as a scan would space them now, only
+  faces are redone. So changing face settings, such as the sampling rate, costs face
+  detection alone. On an 8-core VM without a GPU, two 1-minute phone clips rescanned at
+  1 fps in about 7 s each, against 39–49 s for their first scan with search frames.
 - **Live Photo motion clips** contribute faces to the still, as upstream, but no frame
   embeddings or timeline, since the clip itself is hidden.
 
@@ -403,8 +408,10 @@ Immich's own recognition threshold is 0.5, which is the right neighbourhood.
 
 > **This fork:** `min_fps = "auto"` (the default) samples at `gpu_fps` (8) when detection runs
 > on a GPU and at `cpu_fps` (0.5, one frame every 2 s) when it does not. On a GPU decoding
-> dominates, so 8 fps is nearly free; on CPU every frame is a full detection pass, and 8 fps
-> would take about 16× longer than 0.5. `cluster.min_observations` and `timeline.gap_s` follow
+> dominates, so 8 fps is nearly free; on CPU every frame is a full detection pass. Measured on
+> an 8-core VM without a GPU, with search frames every 2 s, two 1-minute phone clips took
+> about 1.04× as long at 1 fps as at 0.5, 2.1× at 4 fps and 3.3× at 8 fps: at low rates the
+> search frames, about 1.3 s each, take most of the time. `cluster.min_observations` and `timeline.gap_s` follow
 > the chosen rate when left at `"auto"` (1 sighting and 5 s at 0.5 fps; 3 and 3 s at 8 fps).
 > `detect.gpu` overrides the GPU guess, and `ivf check` shows what was chosen.
 

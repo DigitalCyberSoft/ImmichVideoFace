@@ -390,7 +390,10 @@ def scan(
         run_id = state.start_run(cfg.fingerprint, "scan")
 
         results = []
-        totals = {"staged": 0, "banked": 0, "matched": 0, "superseded": 0, "clip_frames": 0}
+        totals = {
+            "staged": 0, "banked": 0, "matched": 0, "superseded": 0,
+            "clip_frames": 0, "kept_frames": 0,
+        }
 
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -401,7 +404,15 @@ def scan(
         ) as progress:
             task = progress.add_task("scanning", total=len(assets))
             for candidate in assets:
-                result = scanner.scan(candidate, keep_crops=report)
+                # A rescan keeps search frames that are already right (same
+                # model, same spacing): on a CPU they cost far more than faces,
+                # so changing only face settings should not redo them.
+                kept = 0
+                if index is not None and detector.clip_model and not candidate.still_asset_id:
+                    kept = index.reusable_frames(
+                        candidate.id, cfg.objects.model, scanner.clip_spacing_s()
+                    )
+                result = scanner.scan(candidate, keep_crops=report, clip=not kept)
                 results.append(result)
                 totals["matched"] += len(result.matched)
 
@@ -412,11 +423,12 @@ def scan(
                         asset_id=candidate.id,
                         duration_s=result.duration_s,
                         frames=result.frames,
-                        frame_embeddings=result.frame_embeddings,
+                        frame_embeddings=None if kept else result.frame_embeddings,
                         model=cfg.objects.model,
                         fingerprint=cfg.fingerprint,
                     )
                     totals["clip_frames"] += len(result.frame_embeddings)
+                    totals["kept_frames"] += kept
 
                 # A Live Photo clip's faces land on the still, which has no timeline.
                 timeline = not candidate.still_asset_id
@@ -498,6 +510,7 @@ def scan(
         if index is not None:
             console.print(
                 f"indexed {totals['clip_frames']} frame(s) for object search"
+                + (f", kept {totals['kept_frames']} already indexed" if totals["kept_frames"] else "")
                 if cfg.objects.enabled
                 else "object search off; videos recorded in the index"
             )

@@ -118,11 +118,25 @@ class VideoIndex:
         asset_id: str,
         duration_s: float,
         frames: int,
-        frame_embeddings: list[tuple[float, np.ndarray]],
+        frame_embeddings: list[tuple[float, np.ndarray]] | None,
         model: str,
         fingerprint: str,
     ) -> None:
-        """Replace everything indexed for one video's frames, atomically."""
+        """Replace everything indexed for one video's frames, atomically.
+
+        `frame_embeddings=None` keeps the frames already indexed (see
+        `reusable_frames`) and updates only the video's record.
+        """
+        if frame_embeddings is None:
+            with self._conn.transaction(), self._conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL(
+                        "UPDATE {} SET duration_ms = %s, frames = %s, fingerprint = %s, "
+                        "indexed_at = now() WHERE asset_id = %s"
+                    ).format(self._t("video")),
+                    (int(round(duration_s * 1000)), frames, fingerprint, asset_id),
+                )
+            return
         rows = []
         seen: set[int] = set()
         for time_s, vector in frame_embeddings:
@@ -154,6 +168,36 @@ class VideoIndex:
                 ).format(self._t("video")),
                 (asset_id, int(round(duration_s * 1000)), frames, len(rows), fingerprint),
             )
+
+    def reusable_frames(self, asset_id: str, model: str, spacing_s: float) -> int:
+        """How many indexed frames a rescan of this video can keep (0: re-embed).
+
+        Kept only when every frame is from `model` and they are spaced as a scan
+        would space them now, so changing the face sampling rate alone does not
+        redo the search frames. The spacing is read off the frames themselves.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    "SELECT count(*), coalesce(bool_and(f.model = %s), false), "
+                    "percentile_cont(0.5) WITHIN GROUP (ORDER BY f.gap), "
+                    "(SELECT duration_ms FROM {} WHERE asset_id = %s) "
+                    "FROM (SELECT model, time_ms - lag(time_ms) OVER (ORDER BY time_ms) AS gap "
+                    "FROM {} WHERE asset_id = %s) f"
+                ).format(self._t("video"), self._t("frame_embedding")),
+                (model, asset_id, asset_id),
+            )
+            count, same_model, median_gap_ms, duration_ms = cur.fetchone()
+        self._conn.rollback()
+        if frames_reusable(
+            count=count,
+            same_model=same_model,
+            median_gap_ms=median_gap_ms,
+            duration_ms=duration_ms,
+            spacing_ms=spacing_s * 1000,
+        ):
+            return int(count)
+        return 0
 
     def frame_models(self) -> set[str]:
         """Search models that frames are currently embedded with."""
@@ -251,6 +295,29 @@ class VideoIndex:
                 counts.append(int(cur.fetchone()[0]))
         self._conn.rollback()
         return IndexStats(*counts)
+
+
+def frames_reusable(
+    *,
+    count: int,
+    same_model: bool,
+    median_gap_ms: float | None,
+    duration_ms: int | None,
+    spacing_ms: float,
+) -> bool:
+    """Whether indexed frames match what a scan with these settings would embed.
+
+    A single frame has no spacing to read, so it is kept only for a video too
+    short to hold a second one. Any doubt means re-embedding, which is merely
+    slower.
+    """
+    if not count or not same_model or spacing_ms <= 0:
+        return False
+    if count == 1:
+        return duration_ms is not None and duration_ms < 1.25 * spacing_ms
+    if median_gap_ms is None:
+        return False
+    return abs(float(median_gap_ms) - spacing_ms) <= 0.25 * spacing_ms
 
 
 def resolve_face_ids(faces: list[dict]) -> dict[str, str]:
